@@ -1,0 +1,19 @@
+szl-substrate
+Copyright 2026 SZL Contributors (ORCID: 0009-0001-0110-4173)
+
+This product includes modules extracted verbatim (byte-identical at extraction
+time, verified with `cmp`) from the a11oy and killinchu application repositories
+to establish a single shared source of truth and eliminate source duplication:
+
+  - szl_calibration : ECE/Brier calibration tracking (pure-Python).
+  - szl_dsse        : DSSE/ECDSA-P256-SHA256 signing (cosign-compatible), with
+                      cryptographic primitives (canonical_json, pae) derived
+                      from khipu-consensus.
+  - szl_brain       : governed reasoning-brain scaffolding (Λ aggregator,
+                      advisory — Conjecture 1).
+
+Λ = Conjecture 1 (advisory, uniqueness open — NOT a proven theorem).
+Signed receipts are real DSSE in a Space with a cosign key, and an explicit
+UNSIGNED-honest marker otherwise. No signature is ever fabricated.
+
+Doctrine v11 LOCKED (749/14/163). SLSA L1 honest · L2 roadmap. Apache-2.0.
