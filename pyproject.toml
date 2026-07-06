@@ -1,0 +1,37 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "szl-substrate"
+version = "0.1.0"
+description = "Installable shared substrate for a11oy + killinchu — eliminates 69-file source duplication. First modules: DSSE/ECDSA-P256-SHA256 signing (cosign-compatible, UNSIGNED-honest fallback), ECE/Brier calibration tracking (pure-Python), and governed reasoning-brain scaffolding. Λ = Conjecture 1 (advisory). SLSA L1 honest · L2 roadmap · Apache-2.0."
+readme = "README.md"
+license = { text = "Apache-2.0" }
+requires-python = ">=3.10"
+authors = [
+    { name = "Lutar, Stephen P.", email = "stephenlutar2@gmail.com" },
+]
+keywords = ["dsse", "cosign", "calibration", "governed-ai", "receipts", "szl", "doctrine-v11"]
+dependencies = [
+    # Required by szl_dsse for real ECDSA-P256-SHA256 signing/verification.
+    # When absent, szl_dsse degrades to an honest UNSIGNED marker — it never
+    # fabricates a signature — but signing is a first-class feature here so we
+    # declare it as a hard dependency of the package.
+    "cryptography>=42",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8",
+]
+
+[project.urls]
+Homepage = "https://github.com/szl-holdings/szl-substrate"
+Repository = "https://github.com/szl-holdings/szl-substrate"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/szl_substrate"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
