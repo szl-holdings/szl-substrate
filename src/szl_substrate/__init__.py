@@ -144,6 +144,46 @@ from . import a11oy_agent_loop  # noqa: E402,F401
 # EAGER (1): szl_live_wires — pure-stdlib at module scope; every heavier import
 # is guarded, so `import szl_substrate` still succeeds with fastapi absent.
 from . import szl_live_wires  # noqa: E402,F401
+
+# M-tier wave 4 (this pass): a dependency-ordered batch that first lands the 5
+# remaining S-tier leaves that block the next M modules, then the 3 M modules
+# they unblock. All 8 were byte-identical between a11oy and killinchu at
+# extraction time (cmp-verified against BOTH fresh clones; none is a
+# drifted/allow-listed file), so each is extracted byte-for-byte. Dependency
+# status (strictly dependency-ordered):
+#   S leaves (deps: none in shared set):
+#     - szl_formulas       : pure-stdlib leaf (blast radius: 5 app + 1 shared)
+#     - szl_conformal      : pure-stdlib leaf
+#     - szl_khipu_replicate: pure-stdlib leaf
+#     - szl_unay           : pure-stdlib leaf
+#     - szl_khipu_lmdb     : leaf, but UNGUARDED module-level `import lmdb`
+#   M modules (every shared dep now ALREADY in the package via this same batch):
+#     - a11oy_autoreview   : szl_calibration / szl_conformal / szl_restraint, ALL
+#                            guarded (try/except -> None); module scope pure-stdlib
+#     - szl_anatomy_routes : UNGUARDED module-level `import szl_formulas` (✅ in this
+#                            batch); fastapi guarded
+#     - szl_unay_routes    : UNGUARDED module-level `import szl_unay` /
+#                            `import szl_khipu_lmdb` / `import szl_khipu_replicate`
+#                            (all ✅ in this batch); fastapi guarded
+#
+# EAGER (5): pure-stdlib at module scope (a11oy_autoreview's shared-dep imports
+# are all wrapped in try/except -> None), so `import szl_substrate` never fails
+# on their behalf (verified with fastapi + lmdb absent).
+from . import szl_formulas  # noqa: E402,F401
+from . import szl_conformal  # noqa: E402,F401
+from . import szl_khipu_replicate  # noqa: E402,F401
+from . import szl_unay  # noqa: E402,F401
+from . import a11oy_autoreview  # noqa: E402,F401
+#
+# IMPORT-DIRECTLY (3): each has an UNGUARDED module-level import that would break
+# `import szl_substrate` wherever that dependency is absent, so — exactly like
+# szl_connectors_serve / szl_sapa_patch — they are EXCLUDED from eager import and
+# imported directly (`from szl_substrate import X`) only where their dependency is
+# present. They still ship as importable byte-identical submodule files:
+#   - szl_khipu_lmdb    : module-level `import lmdb`
+#   - szl_anatomy_routes: module-level `import szl_formulas` (bare name)
+#   - szl_unay_routes   : module-level `import szl_unay` / `szl_khipu_lmdb` /
+#                         `szl_khipu_replicate` (bare names) + transitive `lmdb`
 #
 # IMPORT-DIRECTLY (1): szl_sapa_patch — module-level fastapi + bare `import
 # szl_sapa`, so it is EXCLUDED from eager import and imported directly
@@ -213,6 +253,16 @@ __all__ = [
     "a11oy_agent_loop",
     # M-tier wave 3 (eager — pure-stdlib at module scope; heavier deps guarded)
     "szl_live_wires",
+    # M-tier wave 4 (eager — pure-stdlib at module scope; shared deps guarded)
+    "szl_formulas",
+    "szl_conformal",
+    "szl_khipu_replicate",
+    "szl_unay",
+    "a11oy_autoreview",
+    # M-tier wave 4 (import-directly, NOT eager — unguarded module-level dep):
+    #   szl_khipu_lmdb (lmdb), szl_anatomy_routes (szl_formulas),
+    #   szl_unay_routes (szl_unay/szl_khipu_lmdb/szl_khipu_replicate). They ship
+    #   as importable byte-identical submodule files.
     # M-tier wave 3 (import-directly, NOT eager — module-level fastapi + bare
     #   `import szl_sapa`): szl_sapa_patch. It ships as a submodule file.
     # M-tier wave 2 (import-directly, NOT eager — module-level fastapi):
