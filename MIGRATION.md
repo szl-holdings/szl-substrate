@@ -56,6 +56,45 @@ whose difficulty is purely their wide fan-out.
   shim. If the package is absent, the app falls back to its local copy and keeps
   working. Nothing is deleted from the apps in this pass.
 
+### Wave-S batch (this pass) — 10 more S-tier leaves extracted
+
+Continuing the proven POC pattern (a11oy #735 merged), **10 additional S-tier
+leaf modules** were extracted into `src/szl_substrate/`, byte-identical to the
+app copies at extraction time. Every one satisfies the *safest* selection
+criteria: **0 app-file importers + ≤1 shared-file importer, no local (shared-set)
+imports, and byte-identical between a11oy and killinchu (`cmp` verified).** None
+is a drifted file, none is M/L:
+
+| Module | Tier | Blast radius | Module-level deps |
+|--------|------|--------------|-------------------|
+| `szl_allodial.py` | S | 0 app + 1 shared | stdlib only |
+| `a11oy_hf_assets.py` | S | 0 app + 1 shared | stdlib only |
+| `szl_chain_of_title.py` | S | 0 app + 1 shared | stdlib only |
+| `szl_conjecture_factory.py` | S | 0 app + 1 shared | stdlib only |
+| `szl_connectors_serve.py` | S | 0 app + 1 shared | **unguarded `import szl_connectors`** → NOT eager-imported in `__init__`; import directly |
+| `szl_ecosystem_routes.py` | S | 0 app + 1 shared | stdlib only |
+| `szl_entanglement.py` | S | 0 app + 1 shared | stdlib only |
+| `szl_metrics_prom.py` | S | 0 app + 1 shared | stdlib only |
+| `szl_neuroplasticity.py` | S | 0 app + 1 shared | stdlib only |
+| `szl_scaling.py` | S | 0 app + 1 shared | stdlib only |
+
+  9 of the 10 are pure-stdlib at module scope and are eager-imported in
+  `szl_substrate/__init__.py`. `szl_connectors_serve` carries an **unguarded
+  module-level `import szl_connectors`**, so it is intentionally *excluded* from
+  eager import and is instead imported directly
+  (`from szl_substrate import szl_connectors_serve`) only where `szl_connectors`
+  is present — the package stays importable everywhere.
+
+- **a11oy repoint (guarded, no self-merge).** The companion a11oy PR repoints
+  each of these 10 `import X as _alias` call sites (all already inside
+  `try/except` blocks in `serve.py` / `organs`) to prefer the package with a
+  nested guarded fallback:
+  `try: from szl_substrate import X as _alias  except Exception: import X as
+  _alias`. If the package is absent the app falls back to its local vendored
+  copy; the outer `except` remains the final safety net. **Nothing is deleted
+  from the apps; killinchu is untouched, so the a11oy↔killinchu drift guard stays
+  green.**
+
 ## Recommended rollout order
 
 1. **Reconcile the 4 drifted files** to one canonical copy (out of band).
@@ -85,29 +124,29 @@ Legend: `used by N app + M shared file(s)` = reverse coupling (blast radius).
 
 | # | File | Tier | Deps note |
 |---|------|------|-----------|
-| 1 | `a11oy_hf_assets.py` | **S** | leaf: no local imports; used by 0 app + 1 shared file(s) |
+| 1 | `a11oy_hf_assets.py` | **S** | leaf: no local imports; used by 0 app + 1 shared file(s) ✅ **MOVED (Wave-S)** |
 | 2 | `a11oy_uds_portability_nav.py` | **S** | leaf: no local imports; used by 0 app + 0 shared file(s) |
 | 3 | `a11oy_waqay_nav.py` | **S** | leaf: no local imports; used by 0 app + 0 shared file(s) |
 | 4 | `a11oy_yupay_nav.py` | **S** | leaf: no local imports; used by 0 app + 0 shared file(s) |
-| 5 | `szl_allodial.py` | **S** | leaf: no local imports; used by 0 app + 1 shared file(s) |
-| 6 | `szl_chain_of_title.py` | **S** | leaf: no local imports; used by 0 app + 1 shared file(s) |
-| 7 | `szl_conjecture_factory.py` | **S** | leaf: no local imports; used by 0 app + 1 shared file(s) |
+| 5 | `szl_allodial.py` | **S** | leaf: no local imports; used by 0 app + 1 shared file(s) ✅ **MOVED (Wave-S)** |
+| 6 | `szl_chain_of_title.py` | **S** | leaf: no local imports; used by 0 app + 1 shared file(s) ✅ **MOVED (Wave-S)** |
+| 7 | `szl_conjecture_factory.py` | **S** | leaf: no local imports; used by 0 app + 1 shared file(s) ✅ **MOVED (Wave-S)** |
 | 8 | `szl_connector_mcp.py` | **S** | leaf: no local imports; used by 0 app + 0 shared file(s) |
-| 9 | `szl_connectors_serve.py` | **S** | leaf: no local imports; used by 0 app + 1 shared file(s) |
+| 9 | `szl_connectors_serve.py` | **S** | leaf: no local imports; used by 0 app + 1 shared file(s) ✅ **MOVED (Wave-S)** (unguarded `import szl_connectors`; not eager-imported) |
 | 10 | `szl_contracting.py` | **S** | leaf: no local imports; used by 0 app + 0 shared file(s) |
 | 11 | `szl_deepdive_gaps.py` | **S** | leaf: no local imports; used by 0 app + 0 shared file(s) |
-| 12 | `szl_ecosystem_routes.py` | **S** | leaf: no local imports; used by 0 app + 1 shared file(s) |
-| 13 | `szl_entanglement.py` | **S** | leaf: no local imports; used by 0 app + 1 shared file(s) |
+| 12 | `szl_ecosystem_routes.py` | **S** | leaf: no local imports; used by 0 app + 1 shared file(s) ✅ **MOVED (Wave-S)** |
+| 13 | `szl_entanglement.py` | **S** | leaf: no local imports; used by 0 app + 1 shared file(s) ✅ **MOVED (Wave-S)** |
 | 14 | `szl_formula_wiring.py` | **S** | leaf: no local imports; used by 0 app + 2 shared file(s) |
 | 15 | `szl_khipu_lmdb.py` | **S** | leaf: no local imports; used by 0 app + 1 shared file(s) |
 | 16 | `szl_khipu_replicate.py` | **S** | leaf: no local imports; used by 0 app + 1 shared file(s) |
 | 17 | `szl_logging.py` | **S** | leaf: no local imports; used by 0 app + 0 shared file(s) |
 | 18 | `szl_mbse_nav.py` | **S** | leaf: no local imports; used by 0 app + 0 shared file(s) |
-| 19 | `szl_metrics_prom.py` | **S** | leaf: no local imports; used by 0 app + 1 shared file(s) |
-| 20 | `szl_neuroplasticity.py` | **S** | leaf: no local imports; used by 0 app + 1 shared file(s) |
+| 19 | `szl_metrics_prom.py` | **S** | leaf: no local imports; used by 0 app + 1 shared file(s) ✅ **MOVED (Wave-S)** |
+| 20 | `szl_neuroplasticity.py` | **S** | leaf: no local imports; used by 0 app + 1 shared file(s) ✅ **MOVED (Wave-S)** |
 | 21 | `szl_readiness.py` | **S** | leaf: no local imports; used by 0 app + 1 shared file(s) |
 | 22 | `szl_rosie_companion.py` | **S** | leaf: no local imports; used by 0 app + 1 shared file(s) |
-| 23 | `szl_scaling.py` | **S** | leaf: no local imports; used by 0 app + 1 shared file(s) |
+| 23 | `szl_scaling.py` | **S** | leaf: no local imports; used by 0 app + 1 shared file(s) ✅ **MOVED (Wave-S)** |
 | 24 | `szl_uds_portability.py` | **S** | leaf: no local imports; used by 0 app + 0 shared file(s) |
 | 25 | `szl_unified_formulas.py` | **S** | leaf: no local imports; used by 0 app + 1 shared file(s) |
 | 26 | `a11oy_mcp_client.py` | **S** | leaf: no local imports; used by 1 app + 0 shared file(s) |
