@@ -200,6 +200,69 @@ from . import a11oy_autoreview  # noqa: E402,F401
 #   - szl_yupay : module-level `from fastapi import Request` (szl_dsse/szl_restraint lazy)
 # They still ship as importable submodule files and are byte-identical extracts.
 
+# =========================================================================
+# Wave-K finish batch (this pass): the ENTIRE remaining safe universe.
+# =========================================================================
+# With every prior wave landed, this pass migrates ALL remaining shared
+# modules that are byte-identical between a11oy and killinchu (cmp-verified
+# against BOTH fresh clones), leaving ONLY serve.py per-app. It includes the
+# five modules that were previously allow-listed as "killinchu sync pending"
+# drift but are now BYTE-IDENTICAL again in both repos (the sync landed in
+# later waves): szl_rag, szl_v4_fleet, a11oy_code_engine, szl_agentic_loop,
+# szl_joules_truth. Their now-STALE drift-allow-list entries are removed in
+# BOTH app repos in the companion PRs (tightening the ratchet, exactly as the
+# drift guard's stale-allow WARNING invites) — a signature is never fabricated
+# and no real divergence is masked.
+#
+# szl_joules_truth is the second L-tier leaf (11 app + 2 shared importers);
+# its wide fan-out is handled the same guarded-shim way as szl_dsse.
+#
+# EAGER (25): pure-stdlib at module scope, or every heavier/first-party import
+# is guarded (try/except or in-function), so `import szl_substrate` never fails
+# on their behalf (verified with fastapi + lmdb + starlette + szl_connectors
+# all absent). Their intra-shared deps are all already in the package or only
+# referenced lazily+guarded and degrade gracefully.
+from . import a11oy_uds_portability_nav  # noqa: E402,F401
+from . import a11oy_waqay_nav  # noqa: E402,F401
+from . import a11oy_yupay_nav  # noqa: E402,F401
+from . import szl_contracting  # noqa: E402,F401
+from . import szl_formula_wiring  # noqa: E402,F401
+from . import szl_logging  # noqa: E402,F401
+from . import szl_mbse_nav  # noqa: E402,F401
+from . import szl_readiness  # noqa: E402,F401
+from . import szl_unified_formulas  # noqa: E402,F401
+from . import a11oy_mcp_client  # noqa: E402,F401
+from . import szl_codename_gate  # noqa: E402,F401
+from . import szl_cuas_formulas  # noqa: E402,F401
+from . import szl_hf_bucket  # noqa: E402,F401
+from . import szl_khipu_consensus  # noqa: E402,F401
+from . import szl_v4_fleet  # noqa: E402,F401
+from . import szl_rag  # noqa: E402,F401
+from . import szl_spaces_proxy  # noqa: E402,F401
+from . import szl_spaces_surface  # noqa: E402,F401
+from . import a11oy_code_engine  # noqa: E402,F401
+from . import a11oy_org_rag  # noqa: E402,F401
+from . import szl_energy_sovereign  # noqa: E402,F401
+from . import szl_agentic_loop  # noqa: E402,F401
+from . import szl_joules_truth  # noqa: E402,F401
+#
+# IMPORT-DIRECTLY (4): each has an UNGUARDED module-level import that would
+# break `import szl_substrate` wherever that dependency is absent, so — exactly
+# like szl_connectors_serve / szl_sapa_patch / szl_waqay — they are EXCLUDED
+# from eager import and imported directly (`from szl_substrate import X`) only
+# where their dependency is present. They still ship as importable
+# byte-identical submodule files:
+#   - szl_connector_mcp : module-level `import szl_connectors` (app path only)
+#   - szl_deepdive_gaps : module-level `from fastapi import ...`
+#   - szl_quantum_bio   : module-level `from starlette import ...`
+#   - szl_uds_portability: module-level `try fastapi except starlette` (both
+#                         raise if neither installed — same shape as szl_waqay)
+#   - szl_rosie_companion: module-level `from fastapi import ...` fallback that
+#                         also raises when fastapi/starlette are both absent
+#   - test_szl_hf_bucket: module-level `import szl_hf_bucket` (bare name; it is
+#                         the module's own byte-identical unit test, shipped so
+#                         the 69-file shared set is fully accounted for)
+
 # Convenience re-exports of the most commonly used entry points. These are the
 # stable public surface the apps import through the guarded shim.
 from .szl_dsse import (  # noqa: E402,F401
@@ -265,6 +328,35 @@ __all__ = [
     #   as importable byte-identical submodule files.
     # M-tier wave 3 (import-directly, NOT eager — module-level fastapi + bare
     #   `import szl_sapa`): szl_sapa_patch. It ships as a submodule file.
+    # Wave-K finish batch (eager)
+    "a11oy_uds_portability_nav",
+    "a11oy_waqay_nav",
+    "a11oy_yupay_nav",
+    "szl_contracting",
+    "szl_formula_wiring",
+    "szl_logging",
+    "szl_mbse_nav",
+    "szl_readiness",
+    "szl_unified_formulas",
+    "a11oy_mcp_client",
+    "szl_codename_gate",
+    "szl_cuas_formulas",
+    "szl_hf_bucket",
+    "szl_khipu_consensus",
+    "szl_v4_fleet",
+    "szl_rag",
+    "szl_spaces_proxy",
+    "szl_spaces_surface",
+    "a11oy_code_engine",
+    "a11oy_org_rag",
+    "szl_energy_sovereign",
+    "szl_agentic_loop",
+    "szl_joules_truth",
+    # Wave-K finish batch (import-directly, NOT eager — unguarded module-level
+    #   dep): szl_connector_mcp (szl_connectors), szl_deepdive_gaps (fastapi),
+    #   szl_quantum_bio (starlette), szl_uds_portability (fastapi/starlette),
+    #   szl_rosie_companion (fastapi/starlette), test_szl_hf_bucket
+    #   (szl_hf_bucket). They ship as importable byte-identical submodule files.
     # M-tier wave 2 (import-directly, NOT eager — module-level fastapi):
     #   szl_waqay, szl_yupay. They ship as submodule files.
     # _vendor_blobs is underscore-private but ships as an importable submodule
