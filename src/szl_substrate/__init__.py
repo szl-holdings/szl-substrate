@@ -107,6 +107,37 @@ from . import szl_restraint  # noqa: E402,F401
 #   - szl_llm_registry      : module-level `from fastapi import ...`
 # They still ship as importable submodule files and are byte-identical extracts.
 
+# M-tier wave 2 (this pass): 6 more M-tier modules whose shared-module deps are
+# ALREADY in the package, or are only referenced lazily+guarded inside functions
+# and degrade gracefully. All 6 were byte-identical between a11oy and killinchu at
+# extraction time (cmp-verified), none was a drifted/allow-listed file, so each is
+# extracted byte-for-byte. Dependency status:
+#   - szl_alloy_models : szl_llm_registry (in-function, lazy)      ✅ dep moved
+#   - szl_mbse_cosim   : szl_dsse + szl_restraint (in-function)    ✅ deps moved
+#   - szl_sapa         : szl_dsse (lazy) + szl_energy_sovereign
+#                        (lazy+guarded soft-import, degrades)       ✅ szl_dsse moved
+#   - a11oy_agent_loop : szl_brain (module-level but guarded
+#                        try/except -> None) + szl_agent_loop_banach (lazy) ✅
+#
+# EAGER (4): pure-stdlib at module scope, so safe to import anywhere. Their
+# szl_dsse / szl_restraint / szl_llm_registry / szl_energy_sovereign uses are all
+# lazy+guarded inside functions; a11oy_agent_loop's szl_brain import is wrapped in
+# try/except -> None, so its absence never breaks the module import.
+from . import szl_alloy_models  # noqa: E402,F401
+from . import szl_mbse_cosim  # noqa: E402,F401
+from . import szl_sapa  # noqa: E402,F401
+from . import a11oy_agent_loop  # noqa: E402,F401
+#
+# IMPORT-DIRECTLY (2): each has an UNGUARDED module-level `from fastapi import
+# Request` (with a starlette fallback that also raises if neither is installed),
+# so eager-importing them would break `import szl_substrate` wherever fastapi and
+# starlette are both absent. Exactly like szl_llm_registry / operator_shell_v4,
+# they are EXCLUDED from eager import and imported directly
+# (`from szl_substrate import X`) only where fastapi/starlette is present:
+#   - szl_waqay : module-level `from fastapi import Request` (szl_dsse/szl_restraint lazy)
+#   - szl_yupay : module-level `from fastapi import Request` (szl_dsse/szl_restraint lazy)
+# They still ship as importable submodule files and are byte-identical extracts.
+
 # Convenience re-exports of the most commonly used entry points. These are the
 # stable public surface the apps import through the guarded shim.
 from .szl_dsse import (  # noqa: E402,F401
@@ -153,6 +184,13 @@ __all__ = [
     # M-tier wave 1 (import-directly, NOT eager — unguarded module-level dep):
     #   szl_provenance (szl_dsse), szl_warhacker_aliases / operator_shell_v4 /
     #   szl_llm_registry (fastapi). They ship as submodule files.
+    # M-tier wave 2 (eager — pure-stdlib at module scope; deps lazy/guarded)
+    "szl_alloy_models",
+    "szl_mbse_cosim",
+    "szl_sapa",
+    "a11oy_agent_loop",
+    # M-tier wave 2 (import-directly, NOT eager — module-level fastapi):
+    #   szl_waqay, szl_yupay. They ship as submodule files.
     # _vendor_blobs is underscore-private but ships as an importable submodule
     # dsse
     "sign_payload",
