@@ -99,6 +99,43 @@ is a drifted file, none is M/L:
   from the apps; killinchu is untouched, so the a11oy↔killinchu drift guard stays
   green.**
 
+### M-tier wave 1 (this pass) — 7 M-tier modules extracted (deps already moved)
+
+With the S-tier leaves and the 3 reconciled drift files in the package, the first
+safe **M-tier** batch was extracted. Selection is strictly dependency-ordered and
+drift-safe: **every module's shared-module dependency is ALREADY in the package**,
+and each file is **byte-identical between a11oy and killinchu** (`cmp`-verified,
+none is a drifted/allow-listed file), so each is extracted byte-for-byte. Their
+`szl_dsse` / `szl_rag` / `szl_joules_truth` uses are lazy+guarded inside functions
+and degrade gracefully, so no unmoved dependency is required at module scope.
+
+| Module | Tier | Shared dep (status) | Import mode in package |
+|--------|------|---------------------|------------------------|
+| `szl_ken.py` | M | `szl_dsse` ✅ moved (lazy) | eager (pure-stdlib at module scope) |
+| `szl_qhawaq.py` | M | `szl_dsse` ✅ moved (lazy) | eager (pure-stdlib at module scope) |
+| `szl_restraint.py` | M | `szl_joules_truth` (lazy+guarded, degrades) | eager (pure-stdlib at module scope) |
+| `szl_provenance.py` | M | `szl_dsse` ✅ moved (**module-level**) | import-directly (not eager) |
+| `szl_warhacker_aliases.py` | M | `szl_dsse` (lazy) | import-directly (module-level `fastapi`) |
+| `operator_shell_v4.py` | M | `szl_dsse` (lazy) | import-directly (module-level `fastapi`) |
+| `szl_llm_registry.py` | M | `szl_rag` (lazy+guarded, degrades) | import-directly (module-level `fastapi`) |
+
+3 are eager-imported from `szl_substrate/__init__.py` (pure-stdlib at module
+scope). The other 4 carry an **unguarded module-level import** (`szl_provenance`
+→ `szl_dsse`; the other three → `fastapi`) and are therefore **excluded from
+eager import** and imported directly (`from szl_substrate import X`) only where
+that dependency is present — exactly the pattern already used for
+`szl_connectors_serve`. This keeps `import szl_substrate` working everywhere
+(verified: the package still imports with `fastapi` absent). Coverage:
+`tests/test_mtier_wave1.py` (full suite green).
+
+**a11oy repoint (guarded, no self-merge).** The companion a11oy PR repoints each
+of these call sites to prefer the package with a nested guarded fallback
+(`try: from szl_substrate import X … except Exception: import X …local`). If the
+package is absent the app falls back to its local vendored copy. **Nothing is
+deleted from the apps; killinchu is untouched and the shared source surface is
+unchanged, so the a11oy↔killinchu drift guard stays green.** `serve.py` and any
+module whose deps have not moved were NOT touched.
+
 ## Drift reconciliation (Wave-E dev 5)
 
 The 4 files flagged as **DRIFTED** were inspected line-by-line across both repos.
@@ -187,22 +224,22 @@ Legend: `used by N app + M shared file(s)` = reverse coupling (blast radius).
 | 34 | `szl_khipu_consensus.py` | **S** | leaf: no local imports; used by 2 app + 1 shared file(s) |
 | 35 | `szl_v4_fleet.py` | **S** | leaf: no local imports; used by 2 app + 0 shared file(s) |
 | 36 | `szl_formulas.py` | **S** | leaf: no local imports; used by 5 app + 1 shared file(s) |
-| 37 | `operator_shell_v4.py` | **M** | imports shared: szl_dsse; used by 0 app + 1 shared file(s) |
+| 37 | `operator_shell_v4.py` | **M** | imports shared: szl_dsse (lazy); used by 0 app + 1 shared file(s) ✅ **MOVED (M-tier wave 1)** (module-level fastapi → import-directly) |
 | 38 | `szl_alloy_models.py` | **M** | imports shared: szl_llm_registry; used by 0 app + 1 shared file(s) |
 | 39 | `szl_anatomy_routes.py` | **M** | imports shared: szl_formulas; used by 0 app + 2 shared file(s) |
 | 40 | `szl_rag.py` | **M** | imports shared: szl_brain; used by 0 app + 3 shared file(s) |
 | 41 | `szl_sapa_patch.py` | **M** | imports shared: szl_sapa; used by 0 app + 0 shared file(s) |
 | 42 | `szl_spaces_proxy.py` | **M** | imports shared: serve; used by 0 app + 1 shared file(s) |
 | 43 | `szl_spaces_surface.py` | **M** | imports shared: serve; used by 0 app + 1 shared file(s) |
-| 44 | `szl_warhacker_aliases.py` | **M** | imports shared: szl_dsse; used by 0 app + 1 shared file(s) |
+| 44 | `szl_warhacker_aliases.py` | **M** | imports shared: szl_dsse; used by 0 app + 1 shared file(s) ✅ **MOVED (M-tier wave 1)** (module-level fastapi → import-directly) |
 | 45 | `test_szl_hf_bucket.py` | **M** | imports shared: szl_hf_bucket; used by 0 app + 0 shared file(s) |
 | 46 | `szl_brain.py` | **M** | imports shared: szl_rag; used by 1 app + 4 shared file(s) ✅ **MOVED (this pass)** |
-| 47 | `szl_ken.py` | **M** | imports shared: szl_dsse; used by 1 app + 1 shared file(s) |
-| 48 | `szl_llm_registry.py` | **M** | imports shared: szl_rag; used by 1 app + 3 shared file(s) |
-| 49 | `szl_provenance.py` | **M** | imports shared: szl_dsse; used by 1 app + 1 shared file(s) |
-| 50 | `szl_qhawaq.py` | **M** | imports shared: szl_dsse; used by 1 app + 0 shared file(s) |
+| 47 | `szl_ken.py` | **M** | imports shared: szl_dsse; used by 1 app + 1 shared file(s) ✅ **MOVED (M-tier wave 1)** (eager) |
+| 48 | `szl_llm_registry.py` | **M** | imports shared: szl_rag (lazy+guarded, degrades); used by 1 app + 3 shared file(s) ✅ **MOVED (M-tier wave 1)** (module-level fastapi → import-directly) |
+| 49 | `szl_provenance.py` | **M** | imports shared: szl_dsse (module-level); used by 1 app + 1 shared file(s) ✅ **MOVED (M-tier wave 1)** (import-directly) |
+| 50 | `szl_qhawaq.py` | **M** | imports shared: szl_dsse; used by 1 app + 0 shared file(s) ✅ **MOVED (M-tier wave 1)** (eager) |
 | 51 | `szl_sapa.py` | **M** | imports shared: szl_dsse, szl_energy_sovereign; used by 0 app + 1 shared file(s) |
-| 52 | `szl_restraint.py` | **M** | imports shared: szl_joules_truth; used by 4 app + 5 shared file(s) |
+| 52 | `szl_restraint.py` | **M** | imports shared: szl_joules_truth (lazy+guarded, degrades); used by 4 app + 5 shared file(s) ✅ **MOVED (M-tier wave 1)** (eager) |
 | 53 | `szl_mbse_cosim.py` | **M** | imports shared: szl_dsse, szl_restraint; used by 1 app + 0 shared file(s) |
 | 54 | `szl_waqay.py` | **M** | imports shared: szl_dsse, szl_restraint; used by 1 app + 1 shared file(s) |
 | 55 | `szl_yupay.py` | **M** | imports shared: szl_dsse, szl_restraint; used by 1 app + 0 shared file(s) |
