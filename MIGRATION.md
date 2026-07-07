@@ -136,6 +136,55 @@ deleted from the apps; killinchu is untouched and the shared source surface is
 unchanged, so the a11oy↔killinchu drift guard stays green.** `serve.py` and any
 module whose deps have not moved were NOT touched.
 
+### M-tier wave 2 (this pass) — 6 M-tier modules extracted (deps satisfied)
+
+Continuing the dependency-ordered M-tier rollout, the next safe batch of **6
+M-tier modules** was extracted into `src/szl_substrate/`. Selection is strictly
+dependency-ordered and drift-safe: **every module's shared-module dependency is
+ALREADY in the package** (`szl_dsse`, `szl_restraint`, `szl_llm_registry`,
+`szl_brain`), or is referenced only *lazily + guarded inside functions* and
+degrades gracefully (`szl_energy_sovereign` for `szl_sapa`; `szl_brain` via a
+`try/except -> None` guard for `a11oy_agent_loop`). Each file is **byte-identical
+between a11oy and killinchu** (`cmp`-verified, none is a drifted/allow-listed
+file), so each is extracted byte-for-byte.
+
+| Module | Tier | Shared dep (status) | Import mode in package |
+|--------|------|---------------------|------------------------|
+| `szl_alloy_models.py` | M | `szl_llm_registry` ✅ moved (in-function, lazy) | eager (pure-stdlib at module scope) |
+| `szl_mbse_cosim.py` | M | `szl_dsse` ✅ + `szl_restraint` ✅ moved (lazy) | eager (pure-stdlib at module scope) |
+| `szl_sapa.py` | M | `szl_dsse` ✅ moved (lazy) + `szl_energy_sovereign` (lazy+guarded, degrades) | eager (pure-stdlib at module scope) |
+| `a11oy_agent_loop.py` | M | `szl_brain` ✅ moved (module-level but `try/except -> None`) | eager (pure-stdlib at module scope) |
+| `szl_waqay.py` | M | `szl_dsse` ✅ + `szl_restraint` ✅ moved (lazy) | import-directly (module-level `fastapi`) |
+| `szl_yupay.py` | M | `szl_dsse` ✅ + `szl_restraint` ✅ moved (lazy) | import-directly (module-level `fastapi`) |
+
+4 are eager-imported from `szl_substrate/__init__.py` (pure-stdlib at module
+scope; their `szl_dsse` / `szl_restraint` / `szl_llm_registry` /
+`szl_energy_sovereign` uses are lazy+guarded inside functions, and
+`a11oy_agent_loop`'s `import szl_brain` is wrapped in `try/except -> None`, so the
+module import never fails). The other 2 carry an **unguarded module-level
+`from fastapi import Request`** (with a starlette fallback that also raises if
+neither is installed) and are therefore **excluded from eager import** and
+imported directly (`from szl_substrate import X`) only where fastapi/starlette is
+present — exactly the pattern already used for `szl_llm_registry` /
+`operator_shell_v4` / `szl_connectors_serve`. This keeps `import szl_substrate`
+working everywhere (verified: the package still imports with `fastapi` absent).
+Coverage: `tests/test_mtier_wave2.py` (full suite green).
+
+`szl_rag` was **deliberately NOT moved** this pass: although `szl_brain` (its
+dep) is in the package, `szl_rag` has genuinely **DRIFTED** between a11oy
+(`organs/amaru/szl_rag.py`, library-only) and killinchu (adds an optional RRF
+hybrid reranker stage) and is not on the reconciled-canonical allow-list, so it
+fails the byte-identical / settled-canonical bar. `serve.py` and any module whose
+deps have not moved (e.g. `szl_anatomy_routes` → unmoved `szl_formulas` at module
+scope) were NOT touched.
+
+**a11oy repoint (guarded, no self-merge).** The companion a11oy PR repoints each
+of these call sites to prefer the package with a nested guarded fallback
+(`try: from szl_substrate import X … except Exception: import X …local`). If the
+package is absent the app falls back to its local vendored copy. **Nothing is
+deleted from the apps; killinchu is untouched and the shared source surface is
+unchanged, so the a11oy↔killinchu drift guard stays green.**
+
 ## Drift reconciliation (Wave-E dev 5)
 
 The 4 files flagged as **DRIFTED** were inspected line-by-line across both repos.
@@ -225,7 +274,7 @@ Legend: `used by N app + M shared file(s)` = reverse coupling (blast radius).
 | 35 | `szl_v4_fleet.py` | **S** | leaf: no local imports; used by 2 app + 0 shared file(s) |
 | 36 | `szl_formulas.py` | **S** | leaf: no local imports; used by 5 app + 1 shared file(s) |
 | 37 | `operator_shell_v4.py` | **M** | imports shared: szl_dsse (lazy); used by 0 app + 1 shared file(s) ✅ **MOVED (M-tier wave 1)** (module-level fastapi → import-directly) |
-| 38 | `szl_alloy_models.py` | **M** | imports shared: szl_llm_registry; used by 0 app + 1 shared file(s) |
+| 38 | `szl_alloy_models.py` | **M** | imports shared: szl_llm_registry (in-function, lazy); used by 0 app + 1 shared file(s) ✅ **MOVED (M-tier wave 2)** (eager) |
 | 39 | `szl_anatomy_routes.py` | **M** | imports shared: szl_formulas; used by 0 app + 2 shared file(s) |
 | 40 | `szl_rag.py` | **M** | imports shared: szl_brain; used by 0 app + 3 shared file(s) |
 | 41 | `szl_sapa_patch.py` | **M** | imports shared: szl_sapa; used by 0 app + 0 shared file(s) |
@@ -238,18 +287,18 @@ Legend: `used by N app + M shared file(s)` = reverse coupling (blast radius).
 | 48 | `szl_llm_registry.py` | **M** | imports shared: szl_rag (lazy+guarded, degrades); used by 1 app + 3 shared file(s) ✅ **MOVED (M-tier wave 1)** (module-level fastapi → import-directly) |
 | 49 | `szl_provenance.py` | **M** | imports shared: szl_dsse (module-level); used by 1 app + 1 shared file(s) ✅ **MOVED (M-tier wave 1)** (import-directly) |
 | 50 | `szl_qhawaq.py` | **M** | imports shared: szl_dsse; used by 1 app + 0 shared file(s) ✅ **MOVED (M-tier wave 1)** (eager) |
-| 51 | `szl_sapa.py` | **M** | imports shared: szl_dsse, szl_energy_sovereign; used by 0 app + 1 shared file(s) |
+| 51 | `szl_sapa.py` | **M** | imports shared: szl_dsse (lazy), szl_energy_sovereign (lazy+guarded, degrades); used by 0 app + 1 shared file(s) ✅ **MOVED (M-tier wave 2)** (eager) |
 | 52 | `szl_restraint.py` | **M** | imports shared: szl_joules_truth (lazy+guarded, degrades); used by 4 app + 5 shared file(s) ✅ **MOVED (M-tier wave 1)** (eager) |
-| 53 | `szl_mbse_cosim.py` | **M** | imports shared: szl_dsse, szl_restraint; used by 1 app + 0 shared file(s) |
-| 54 | `szl_waqay.py` | **M** | imports shared: szl_dsse, szl_restraint; used by 1 app + 1 shared file(s) |
-| 55 | `szl_yupay.py` | **M** | imports shared: szl_dsse, szl_restraint; used by 1 app + 0 shared file(s) |
+| 53 | `szl_mbse_cosim.py` | **M** | imports shared: szl_dsse, szl_restraint (lazy); used by 1 app + 0 shared file(s) ✅ **MOVED (M-tier wave 2)** (eager) |
+| 54 | `szl_waqay.py` | **M** | imports shared: szl_dsse, szl_restraint (lazy); used by 1 app + 1 shared file(s) ✅ **MOVED (M-tier wave 2)** (module-level fastapi → import-directly) |
+| 55 | `szl_yupay.py` | **M** | imports shared: szl_dsse, szl_restraint (lazy); used by 1 app + 0 shared file(s) ✅ **MOVED (M-tier wave 2)** (module-level fastapi → import-directly) |
 | 56 | `a11oy_code_engine.py` | **M** | imports shared: szl_agentic_loop, szl_llm_registry; used by 2 app + 1 shared file(s) |
 | 57 | `_vendor_blobs.py` | **M** | leaf: no local imports; used by 0 app + 1 shared file(s); ✅ **RECONCILED + MOVED (Wave-E dev 5)** — canonical = a11oy superset (63 blobs) |
 | 58 | `a11oy_autoreview.py` | **M** | imports shared: szl_calibration, szl_conformal, szl_restraint; used by 0 app + 1 shared file(s) |
 | 59 | `szl_evidence_research.py` | **M** | leaf: no local imports; used by 0 app + 1 shared file(s); ✅ **RECONCILED + MOVED (Wave-E dev 5)** — canonical = killinchu superset claims + canonical-domain mailto (env-overridable) |
 | 60 | `szl_unay_routes.py` | **M** | imports shared: szl_khipu_lmdb, szl_khipu_replicate, szl_unay; used by 0 app + 1 shared file(s) |
 | 61 | `a11oy_org_rag.py` | **M** | imports shared: szl_brain, szl_rag, szl_waqay; used by 3 app + 1 shared file(s) |
-| 62 | `a11oy_agent_loop.py` | **M** | imports shared: szl_brain; imports app-specific (lazy/guarded): a11oy_active_flux_router; used by 2 app + 0 shared file(s) |
+| 62 | `a11oy_agent_loop.py` | **M** | imports shared: szl_brain (module-level, `try/except -> None`); imports app-specific (lazy/guarded): a11oy_active_flux_router; used by 2 app + 0 shared file(s) ✅ **MOVED (M-tier wave 2)** (eager) |
 | 63 | `szl_live_wires.py` | **M** | imports app-specific (lazy/guarded): szl_jack, szl_wire; used by 0 app + 1 shared file(s) |
 | 64 | `szl_energy_sovereign.py` | **M** | imports shared: szl_joules_truth; imports app-specific (lazy/guarded): a11oy_code_orchestrator, szl_energy_operator; used by 4 app + 3 shared file(s) |
 | 65 | `szl_be_hardening.py` | **M** | imports shared: szl_dsse (lazy/guarded); imports app-specific (lazy/guarded): szl_cheapest_watt, szl_energy_operator; used by 0 app + 1 shared file(s); ✅ **RECONCILED + MOVED (Wave-E dev 5)** — canonical = union of exempt routes + restored SEC-08 Server redaction |
