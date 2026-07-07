@@ -127,6 +127,28 @@ from . import szl_alloy_models  # noqa: E402,F401
 from . import szl_mbse_cosim  # noqa: E402,F401
 from . import szl_sapa  # noqa: E402,F401
 from . import a11oy_agent_loop  # noqa: E402,F401
+
+# M-tier wave 3 (this pass): 2 more M-tier modules whose deps are satisfied.
+# Both are byte-identical between a11oy and killinchu at extraction time
+# (cmp-verified, neither is a drifted/allow-listed file), so each is extracted
+# byte-for-byte. Dependency status:
+#   - szl_live_wires : only app-specific deps (szl_wire, szl_jack) and fastapi,
+#                      ALL wrapped in module-level try/except -> None. Its module
+#                      scope is pure-stdlib, so it is EAGER-safe (importing it
+#                      never fails even when fastapi/szl_wire/szl_jack are absent).
+#   - szl_sapa_patch : szl_sapa ✅ moved. BUT it carries an UNGUARDED module-level
+#                      `import szl_sapa` (bare name) + `from fastapi import
+#                      Request`, so it is import-directly (NOT eager) — exactly
+#                      like szl_waqay / szl_yupay / operator_shell_v4.
+#
+# EAGER (1): szl_live_wires — pure-stdlib at module scope; every heavier import
+# is guarded, so `import szl_substrate` still succeeds with fastapi absent.
+from . import szl_live_wires  # noqa: E402,F401
+#
+# IMPORT-DIRECTLY (1): szl_sapa_patch — module-level fastapi + bare `import
+# szl_sapa`, so it is EXCLUDED from eager import and imported directly
+# (`from szl_substrate import szl_sapa_patch`) only where fastapi and szl_sapa
+# are present. It still ships as an importable submodule file (byte-identical).
 #
 # IMPORT-DIRECTLY (2): each has an UNGUARDED module-level `from fastapi import
 # Request` (with a starlette fallback that also raises if neither is installed),
@@ -189,6 +211,10 @@ __all__ = [
     "szl_mbse_cosim",
     "szl_sapa",
     "a11oy_agent_loop",
+    # M-tier wave 3 (eager — pure-stdlib at module scope; heavier deps guarded)
+    "szl_live_wires",
+    # M-tier wave 3 (import-directly, NOT eager — module-level fastapi + bare
+    #   `import szl_sapa`): szl_sapa_patch. It ships as a submodule file.
     # M-tier wave 2 (import-directly, NOT eager — module-level fastapi):
     #   szl_waqay, szl_yupay. They ship as submodule files.
     # _vendor_blobs is underscore-private but ships as an importable submodule
