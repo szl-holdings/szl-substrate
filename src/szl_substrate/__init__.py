@@ -83,6 +83,30 @@ from . import _vendor_blobs  # noqa: E402,F401
 from . import szl_be_hardening  # noqa: E402,F401
 from . import szl_evidence_research  # noqa: E402,F401
 
+# M-tier wave 1 (this pass): 7 M-tier modules whose shared-module deps are
+# ALREADY in the package (szl_dsse is here; szl_rag / szl_joules_truth are only
+# referenced lazily+guarded inside functions and degrade gracefully). All 7 were
+# byte-identical between a11oy and killinchu at extraction time (cmp-verified),
+# none was a drifted/allow-listed file, so each is extracted byte-for-byte.
+#
+# EAGER (3): pure-stdlib at module scope, so safe to import anywhere. Their
+# szl_dsse / szl_joules_truth uses are all lazy+guarded inside functions.
+from . import szl_ken  # noqa: E402,F401
+from . import szl_qhawaq  # noqa: E402,F401
+from . import szl_restraint  # noqa: E402,F401
+#
+# IMPORT-DIRECTLY (4): each has an UNGUARDED module-level import that would break
+# `import szl_substrate` wherever that dependency is absent, which would violate
+# the package's "importable everywhere" invariant (the same honest-fallback
+# guarantee szl_dsse relies on). So — exactly like `szl_connectors_serve` — they
+# are intentionally EXCLUDED from eager import and imported directly
+# (`from szl_substrate import X`) only where their dependency is present:
+#   - szl_provenance        : module-level `import szl_dsse` (app path only)
+#   - szl_warhacker_aliases : module-level `from fastapi import ...`
+#   - operator_shell_v4     : module-level `from fastapi import ...`
+#   - szl_llm_registry      : module-level `from fastapi import ...`
+# They still ship as importable submodule files and are byte-identical extracts.
+
 # Convenience re-exports of the most commonly used entry points. These are the
 # stable public surface the apps import through the guarded shim.
 from .szl_dsse import (  # noqa: E402,F401
@@ -122,6 +146,13 @@ __all__ = [
     # M-tier reconciled drift (Wave-E dev 5)
     "szl_be_hardening",
     "szl_evidence_research",
+    # M-tier wave 1 (eager — pure-stdlib at module scope)
+    "szl_ken",
+    "szl_qhawaq",
+    "szl_restraint",
+    # M-tier wave 1 (import-directly, NOT eager — unguarded module-level dep):
+    #   szl_provenance (szl_dsse), szl_warhacker_aliases / operator_shell_v4 /
+    #   szl_llm_registry (fastapi). They ship as submodule files.
     # _vendor_blobs is underscore-private but ships as an importable submodule
     # dsse
     "sign_payload",
