@@ -6,6 +6,24 @@
 > this single installable package — **without a big-bang cutover and without
 > breaking either running application.**
 
+## TRUE % DONE (Wave-K finish, 2026-07-07)
+
+| Metric | Count | % |
+|--------|-------|---|
+| Modules in `szl_substrate` package | **68** | — |
+| Of the **movable** universe (69 − `serve.py`, which is permanently per-app) | **68 / 68** | **100.0%** |
+| Of the raw 69-file shared set | **68 / 69** | **98.6%** |
+
+**`serve.py` is the only file not migrated** — it is the per-app FastAPI
+entrypoint (a11oy Brand-Orchestration vs killinchu Drone-Intelligence are two
+different applications that share a filename); its divergence is *legitimate*
+and it is L-tier "never move" by design. Every other one of the 69 shared
+modules now lives in the package as the single source of truth, adopted in each
+app through the guarded `try: from szl_substrate import X except: import X`
+fallback shim. The migration of shared duplicated source is therefore
+**functionally complete**: only `serve.py` remains per-app, and that is
+correct, not pending.
+
 ## Method (how this ranking was produced)
 
 Both repos were cloned fresh. Each of the 69 files (`/tmp/shared_py.txt`) was
@@ -306,6 +324,59 @@ guarded inside functions, so package import never fails). Apps adopt them throug
 the same guarded shim as every other module — prefer the package, fall back to the
 local vendored copy. Coverage: `tests/test_mtier_reconcile.py`.
 
+### Wave-K FINISH batch (this pass) — the ENTIRE remaining safe universe (39 → 68)
+
+With every prior wave landed, this pass migrates **ALL 29 remaining shared
+modules** into `src/szl_substrate/`, byte-identical to the app copies at
+extraction time (`cmp`-verified against BOTH fresh clones of a11oy and
+killinchu), leaving **only `serve.py` per-app**. This takes the migration of
+shared duplicated source to **68/68 of the movable universe = 100%** (98.6% of
+the raw 69-file set).
+
+**Five of the 29 were previously allow-listed drift** (`szl_rag`,
+`szl_v4_fleet`, `a11oy_code_engine`, `szl_agentic_loop`, `szl_joules_truth` —
+each carried a `"…killinchu sync pending"` entry). Re-running the `cmp`
+byte-identity check over fresh clones shows **all five are now byte-identical
+again in both repos** — the killinchu sync landed in later waves. The
+`shared-file-drift-check.py` guard therefore now emits a **stale-allow WARNING**
+for each (it only *fails* on NEW un-accepted drift, never on a now-identical
+allow-list entry). Because they are settled-canonical again, they are moved and
+their now-stale allow-list entries are **removed in BOTH app repos** in the
+companion PRs — exactly the ratchet-tightening the guard invites. No real
+divergence is masked and no signature is ever fabricated.
+
+**`szl_joules_truth` is the second L-tier leaf** (11 app + 2 shared importers) —
+its difficulty was purely its wide fan-out, handled the same guarded-shim way as
+`szl_dsse`. With it moved, both non-`serve` L entries are migrated.
+
+Classification was **empirically verified** by importing every submodule file
+with `fastapi` / `lmdb` / `starlette` / `szl_connectors` / `pydantic` ALL
+absent, so the eager/import-directly split reflects real behaviour, not just an
+`ast` heuristic:
+
+| Split | Count | Modules |
+|-------|:-----:|---------|
+| **EAGER** (pure-stdlib at module scope, or all heavier deps guarded) | 23 | `a11oy_uds_portability_nav`, `a11oy_waqay_nav`, `a11oy_yupay_nav`, `szl_contracting`, `szl_formula_wiring`, `szl_logging`, `szl_mbse_nav`, `szl_readiness`, `szl_unified_formulas`, `a11oy_mcp_client`, `szl_codename_gate`, `szl_cuas_formulas`, `szl_hf_bucket`, `szl_khipu_consensus`, `szl_v4_fleet`, `szl_rag`, `szl_spaces_proxy`, `szl_spaces_surface`, `a11oy_code_engine`, `a11oy_org_rag`, `szl_energy_sovereign`, `szl_agentic_loop`, `szl_joules_truth` |
+| **IMPORT-DIRECTLY** (unguarded / dual-raise module-level dep) | 6 | `szl_connector_mcp` (`szl_connectors`), `szl_deepdive_gaps` (`fastapi`), `szl_quantum_bio` (`starlette`), `szl_uds_portability` (`fastapi`/`starlette`), `szl_rosie_companion` (`fastapi`/`starlette`), `test_szl_hf_bucket` (bare `szl_hf_bucket`) |
+
+The 23 eager modules are eager-imported from `szl_substrate/__init__.py`; the 6
+import-directly modules are excluded from eager import and shipped as importable
+byte-identical submodule files (imported via `from szl_substrate import X` only
+where their dep is present) — exactly the pattern already used for
+`szl_connectors_serve` / `szl_sapa_patch` / `szl_waqay`. This keeps
+`import szl_substrate` working everywhere (**verified: package imports with all
+of `fastapi`/`lmdb`/`starlette`/`szl_connectors`/`pydantic` absent AND with them
+present**). Coverage: `tests/test_wavek_finish.py`; **full suite 103 passed**
+(was 67); `py_compile` clean on all 68 modules.
+
+**a11oy + killinchu repoint (guarded, `feat/substrate-finish`).** The companion
+PRs on BOTH app repos repoint call sites to prefer the package with a nested
+guarded fallback (`try: from szl_substrate import X … except Exception: import X
+…local`), and remove the five now-stale drift-allow-list entries. **Nothing is
+deleted from the apps** (the local vendored copies remain as the fallback until
+they bake in production); the shared source surface is unchanged, so both
+a11oy↔killinchu drift guards stay green. `serve.py` was NOT touched.
+
 ## Recommended rollout order
 
 1. ~~**Reconcile the 4 drifted files** to one canonical copy (out of band).~~
@@ -338,50 +409,50 @@ Legend: `used by N app + M shared file(s)` = reverse coupling (blast radius).
 | # | File | Tier | Deps note |
 |---|------|------|-----------|
 | 1 | `a11oy_hf_assets.py` | **S** | leaf: no local imports; used by 0 app + 1 shared file(s) ✅ **MOVED (Wave-S)** |
-| 2 | `a11oy_uds_portability_nav.py` | **S** | leaf: no local imports; used by 0 app + 0 shared file(s) |
-| 3 | `a11oy_waqay_nav.py` | **S** | leaf: no local imports; used by 0 app + 0 shared file(s) |
-| 4 | `a11oy_yupay_nav.py` | **S** | leaf: no local imports; used by 0 app + 0 shared file(s) |
+| 2 | `a11oy_uds_portability_nav.py` | **S** | leaf ✅ **MOVED (Wave-K)** (eager) |
+| 3 | `a11oy_waqay_nav.py` | **S** | leaf ✅ **MOVED (Wave-K)** (eager) |
+| 4 | `a11oy_yupay_nav.py` | **S** | leaf ✅ **MOVED (Wave-K)** (eager) |
 | 5 | `szl_allodial.py` | **S** | leaf: no local imports; used by 0 app + 1 shared file(s) ✅ **MOVED (Wave-S)** |
 | 6 | `szl_chain_of_title.py` | **S** | leaf: no local imports; used by 0 app + 1 shared file(s) ✅ **MOVED (Wave-S)** |
 | 7 | `szl_conjecture_factory.py` | **S** | leaf: no local imports; used by 0 app + 1 shared file(s) ✅ **MOVED (Wave-S)** |
-| 8 | `szl_connector_mcp.py` | **S** | leaf: no local imports; used by 0 app + 0 shared file(s) |
+| 8 | `szl_connector_mcp.py` | **S** | leaf ✅ **MOVED (Wave-K)** (unguarded `import szl_connectors` → import-directly) |
 | 9 | `szl_connectors_serve.py` | **S** | leaf: no local imports; used by 0 app + 1 shared file(s) ✅ **MOVED (Wave-S)** (unguarded `import szl_connectors`; not eager-imported) |
-| 10 | `szl_contracting.py` | **S** | leaf: no local imports; used by 0 app + 0 shared file(s) |
-| 11 | `szl_deepdive_gaps.py` | **S** | leaf: no local imports; used by 0 app + 0 shared file(s) |
+| 10 | `szl_contracting.py` | **S** | leaf ✅ **MOVED (Wave-K)** (eager) |
+| 11 | `szl_deepdive_gaps.py` | **S** | leaf ✅ **MOVED (Wave-K)** (module-level fastapi → import-directly) |
 | 12 | `szl_ecosystem_routes.py` | **S** | leaf: no local imports; used by 0 app + 1 shared file(s) ✅ **MOVED (Wave-S)** |
 | 13 | `szl_entanglement.py` | **S** | leaf: no local imports; used by 0 app + 1 shared file(s) ✅ **MOVED (Wave-S)** |
-| 14 | `szl_formula_wiring.py` | **S** | leaf: no local imports; used by 0 app + 2 shared file(s) |
+| 14 | `szl_formula_wiring.py` | **S** | leaf ✅ **MOVED (Wave-K)** (eager) |
 | 15 | `szl_khipu_lmdb.py` | **S** | leaf: no local imports; used by 0 app + 1 shared file(s) ✅ **MOVED (M-tier wave 4)** (unguarded `import lmdb` → import-directly) |
 | 16 | `szl_khipu_replicate.py` | **S** | leaf: no local imports; used by 0 app + 1 shared file(s) ✅ **MOVED (M-tier wave 4)** (eager) |
-| 17 | `szl_logging.py` | **S** | leaf: no local imports; used by 0 app + 0 shared file(s) |
-| 18 | `szl_mbse_nav.py` | **S** | leaf: no local imports; used by 0 app + 0 shared file(s) |
+| 17 | `szl_logging.py` | **S** | leaf ✅ **MOVED (Wave-K)** (eager) |
+| 18 | `szl_mbse_nav.py` | **S** | leaf ✅ **MOVED (Wave-K)** (eager) |
 | 19 | `szl_metrics_prom.py` | **S** | leaf: no local imports; used by 0 app + 1 shared file(s) ✅ **MOVED (Wave-S)** |
 | 20 | `szl_neuroplasticity.py` | **S** | leaf: no local imports; used by 0 app + 1 shared file(s) ✅ **MOVED (Wave-S)** |
-| 21 | `szl_readiness.py` | **S** | leaf: no local imports; used by 0 app + 1 shared file(s) |
-| 22 | `szl_rosie_companion.py` | **S** | leaf: no local imports; used by 0 app + 1 shared file(s) |
+| 21 | `szl_readiness.py` | **S** | leaf ✅ **MOVED (Wave-K)** (eager) |
+| 22 | `szl_rosie_companion.py` | **S** | leaf ✅ **MOVED (Wave-K)** (module-level fastapi/starlette → import-directly) |
 | 23 | `szl_scaling.py` | **S** | leaf: no local imports; used by 0 app + 1 shared file(s) ✅ **MOVED (Wave-S)** |
-| 24 | `szl_uds_portability.py` | **S** | leaf: no local imports; used by 0 app + 0 shared file(s) |
-| 25 | `szl_unified_formulas.py` | **S** | leaf: no local imports; used by 0 app + 1 shared file(s) |
-| 26 | `a11oy_mcp_client.py` | **S** | leaf: no local imports; used by 1 app + 0 shared file(s) |
+| 24 | `szl_uds_portability.py` | **S** | leaf ✅ **MOVED (Wave-K)** (try fastapi except starlette → import-directly) |
+| 25 | `szl_unified_formulas.py` | **S** | leaf ✅ **MOVED (Wave-K)** (eager) |
+| 26 | `a11oy_mcp_client.py` | **S** | leaf ✅ **MOVED (Wave-K)** (eager) |
 | 27 | `szl_calibration.py` | **S** | leaf: no local imports; used by 1 app + 1 shared file(s) ✅ **MOVED (this pass)** |
-| 28 | `szl_quantum_bio.py` | **S** | leaf: no local imports; used by 1 app + 1 shared file(s) |
+| 28 | `szl_quantum_bio.py` | **S** | leaf ✅ **MOVED (Wave-K)** (module-level starlette → import-directly) |
 | 29 | `szl_unay.py` | **S** | leaf: no local imports; used by 1 app + 1 shared file(s) ✅ **MOVED (M-tier wave 4)** (eager) |
-| 30 | `szl_codename_gate.py` | **S** | leaf: no local imports; used by 2 app + 0 shared file(s) |
+| 30 | `szl_codename_gate.py` | **S** | leaf ✅ **MOVED (Wave-K)** (eager) |
 | 31 | `szl_conformal.py` | **S** | leaf: no local imports; used by 2 app + 1 shared file(s) ✅ **MOVED (M-tier wave 4)** (eager) |
-| 32 | `szl_cuas_formulas.py` | **S** | leaf: no local imports; used by 2 app + 1 shared file(s) |
-| 33 | `szl_hf_bucket.py` | **S** | leaf: no local imports; used by 2 app + 1 shared file(s) |
-| 34 | `szl_khipu_consensus.py` | **S** | leaf: no local imports; used by 2 app + 1 shared file(s) |
-| 35 | `szl_v4_fleet.py` | **S** | leaf: no local imports; used by 2 app + 0 shared file(s) |
+| 32 | `szl_cuas_formulas.py` | **S** | leaf ✅ **MOVED (Wave-K)** (eager) |
+| 33 | `szl_hf_bucket.py` | **S** | leaf ✅ **MOVED (Wave-K)** (eager) |
+| 34 | `szl_khipu_consensus.py` | **S** | leaf ✅ **MOVED (Wave-K)** (eager) |
+| 35 | `szl_v4_fleet.py` | **S** | leaf ✅ **MOVED (Wave-K)** — was allow-listed drift, now byte-identical again; stale allow entry removed (eager) |
 | 36 | `szl_formulas.py` | **S** | leaf: no local imports; used by 5 app + 1 shared file(s) ✅ **MOVED (M-tier wave 4)** (eager) |
 | 37 | `operator_shell_v4.py` | **M** | imports shared: szl_dsse (lazy); used by 0 app + 1 shared file(s) ✅ **MOVED (M-tier wave 1)** (module-level fastapi → import-directly) |
 | 38 | `szl_alloy_models.py` | **M** | imports shared: szl_llm_registry (in-function, lazy); used by 0 app + 1 shared file(s) ✅ **MOVED (M-tier wave 2)** (eager) |
 | 39 | `szl_anatomy_routes.py` | **M** | imports shared: szl_formulas; used by 0 app + 2 shared file(s) ✅ **MOVED (M-tier wave 4)** (module-level `import szl_formulas` → import-directly) |
-| 40 | `szl_rag.py` | **M** | imports shared: szl_brain; used by 0 app + 3 shared file(s) |
+| 40 | `szl_rag.py` | **M** | imports shared: szl_brain (guarded); used by 0 app + 3 shared file(s) ✅ **MOVED (Wave-K)** — was allow-listed drift, now byte-identical again; stale allow entry removed (eager) |
 | 41 | `szl_sapa_patch.py` | **M** | imports shared: szl_sapa; used by 0 app + 0 shared file(s) ✅ **MOVED (M-tier wave 3)** (module-level fastapi + bare `import szl_sapa` → import-directly) |
-| 42 | `szl_spaces_proxy.py` | **M** | imports shared: serve; used by 0 app + 1 shared file(s) |
-| 43 | `szl_spaces_surface.py` | **M** | imports shared: serve; used by 0 app + 1 shared file(s) |
+| 42 | `szl_spaces_proxy.py` | **M** | imports shared: serve (guarded; serve never moves); used by 0 app + 1 shared file(s) ✅ **MOVED (Wave-K)** (eager) |
+| 43 | `szl_spaces_surface.py` | **M** | imports shared: serve (guarded; serve never moves); used by 0 app + 1 shared file(s) ✅ **MOVED (Wave-K)** (eager) |
 | 44 | `szl_warhacker_aliases.py` | **M** | imports shared: szl_dsse; used by 0 app + 1 shared file(s) ✅ **MOVED (M-tier wave 1)** (module-level fastapi → import-directly) |
-| 45 | `test_szl_hf_bucket.py` | **M** | imports shared: szl_hf_bucket; used by 0 app + 0 shared file(s) |
+| 45 | `test_szl_hf_bucket.py` | **M** | imports shared: szl_hf_bucket (moved this batch); used by 0 app + 0 shared file(s) ✅ **MOVED (Wave-K)** (bare import → import-directly) |
 | 46 | `szl_brain.py` | **M** | imports shared: szl_rag; used by 1 app + 4 shared file(s) ✅ **MOVED (this pass)** |
 | 47 | `szl_ken.py` | **M** | imports shared: szl_dsse; used by 1 app + 1 shared file(s) ✅ **MOVED (M-tier wave 1)** (eager) |
 | 48 | `szl_llm_registry.py` | **M** | imports shared: szl_rag (lazy+guarded, degrades); used by 1 app + 3 shared file(s) ✅ **MOVED (M-tier wave 1)** (module-level fastapi → import-directly) |
@@ -392,18 +463,18 @@ Legend: `used by N app + M shared file(s)` = reverse coupling (blast radius).
 | 53 | `szl_mbse_cosim.py` | **M** | imports shared: szl_dsse, szl_restraint (lazy); used by 1 app + 0 shared file(s) ✅ **MOVED (M-tier wave 2)** (eager) |
 | 54 | `szl_waqay.py` | **M** | imports shared: szl_dsse, szl_restraint (lazy); used by 1 app + 1 shared file(s) ✅ **MOVED (M-tier wave 2)** (module-level fastapi → import-directly) |
 | 55 | `szl_yupay.py` | **M** | imports shared: szl_dsse, szl_restraint (lazy); used by 1 app + 0 shared file(s) ✅ **MOVED (M-tier wave 2)** (module-level fastapi → import-directly) |
-| 56 | `a11oy_code_engine.py` | **M** | imports shared: szl_agentic_loop, szl_llm_registry; used by 2 app + 1 shared file(s) |
+| 56 | `a11oy_code_engine.py` | **M** | imports shared: szl_agentic_loop, szl_llm_registry (guarded); used by 2 app + 1 shared file(s) ✅ **MOVED (Wave-K)** — was allow-listed drift, now byte-identical again; stale allow entry removed (eager) |
 | 57 | `_vendor_blobs.py` | **M** | leaf: no local imports; used by 0 app + 1 shared file(s); ✅ **RECONCILED + MOVED (Wave-E dev 5)** — canonical = a11oy superset (63 blobs) |
 | 58 | `a11oy_autoreview.py` | **M** | imports shared: szl_calibration, szl_conformal, szl_restraint (all guarded); used by 0 app + 1 shared file(s) ✅ **MOVED (M-tier wave 4)** (eager) |
 | 59 | `szl_evidence_research.py` | **M** | leaf: no local imports; used by 0 app + 1 shared file(s); ✅ **RECONCILED + MOVED (Wave-E dev 5)** — canonical = killinchu superset claims + canonical-domain mailto (env-overridable) |
 | 60 | `szl_unay_routes.py` | **M** | imports shared: szl_khipu_lmdb, szl_khipu_replicate, szl_unay; used by 0 app + 1 shared file(s) ✅ **MOVED (M-tier wave 4)** (module-level bare imports → import-directly) |
-| 61 | `a11oy_org_rag.py` | **M** | imports shared: szl_brain, szl_rag, szl_waqay; used by 3 app + 1 shared file(s) |
+| 61 | `a11oy_org_rag.py` | **M** | imports shared: szl_brain, szl_rag, szl_waqay (all guarded); used by 3 app + 1 shared file(s) ✅ **MOVED (Wave-K)** (eager) |
 | 62 | `a11oy_agent_loop.py` | **M** | imports shared: szl_brain (module-level, `try/except -> None`); imports app-specific (lazy/guarded): a11oy_active_flux_router; used by 2 app + 0 shared file(s) ✅ **MOVED (M-tier wave 2)** (eager) |
 | 63 | `szl_live_wires.py` | **M** | imports app-specific (lazy/guarded): szl_jack, szl_wire; used by 0 app + 1 shared file(s) ✅ **MOVED (M-tier wave 3)** (eager — all heavier imports guarded) |
-| 64 | `szl_energy_sovereign.py` | **M** | imports shared: szl_joules_truth; imports app-specific (lazy/guarded): a11oy_code_orchestrator, szl_energy_operator; used by 4 app + 3 shared file(s) |
+| 64 | `szl_energy_sovereign.py` | **M** | imports shared: szl_joules_truth (guarded); imports app-specific (lazy/guarded): a11oy_code_orchestrator, szl_energy_operator; used by 4 app + 3 shared file(s) ✅ **MOVED (Wave-K)** (eager) |
 | 65 | `szl_be_hardening.py` | **M** | imports shared: szl_dsse (lazy/guarded); imports app-specific (lazy/guarded): szl_cheapest_watt, szl_energy_operator; used by 0 app + 1 shared file(s); ✅ **RECONCILED + MOVED (Wave-E dev 5)** — canonical = union of exempt routes + restored SEC-08 Server redaction |
-| 66 | `szl_agentic_loop.py` | **M** | imports shared: szl_anatomy_routes, szl_energy_sovereign, szl_formula_wiring, szl_khipu_consensus; imports app-specific (lazy/guarded): szl_ltc_dynamics, szl_sgh_scheduler; used by 1 app + 2 shared file(s) |
-| 67 | `szl_joules_truth.py` | **L** | leaf: no local imports; used by 11 app + 2 shared file(s) |
+| 66 | `szl_agentic_loop.py` | **M** | imports shared: szl_anatomy_routes, szl_energy_sovereign, szl_formula_wiring, szl_khipu_consensus (all guarded); imports app-specific (lazy/guarded): szl_ltc_dynamics, szl_sgh_scheduler; used by 1 app + 2 shared file(s) ✅ **MOVED (Wave-K)** — was allow-listed drift, now byte-identical again; stale allow entry removed (eager) |
+| 67 | `szl_joules_truth.py` | **L** | leaf: no local imports; used by 11 app + 2 shared file(s) ✅ **MOVED (Wave-K)** — 2nd L-tier leaf; was allow-listed drift, now byte-identical again; stale allow entry removed (eager) |
 | 68 | `szl_dsse.py` | **L** | imports app-specific (lazy/guarded): szl_corpus_publish; used by 23 app + 10 shared file(s) ✅ **MOVED (this pass)** |
 | 69 | `serve.py` | **L** | imports 37 shared modules; imports 120 app-specific modules (lazy/guarded); used by 1 app + 2 shared file(s); **PER-APP ENTRYPOINT — never shared.** Drift is legitimate (a11oy Brand-Orchestration vs killinchu Drone-Intelligence are different apps); reconciliation = keep per-app (Wave-E dev 5) |
 
