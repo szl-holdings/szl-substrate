@@ -22,10 +22,14 @@ parsed with Python's `ast` to compute, for every module:
   module (its "blast radius" = number of guarded shims an app-side adoption PR
   must touch).
 
-Byte-identity between the two repos was verified with `cmp`. **4 files have
-DRIFTED** and are no longer identical (`_vendor_blobs.py`, `serve.py`,
-`szl_be_hardening.py`, `szl_evidence_research.py`) — those must be reconciled to
-a single canonical version *before* extraction.
+Byte-identity between the two repos was verified with `cmp`. **4 files had
+DRIFTED** and were no longer identical (`_vendor_blobs.py`, `serve.py`,
+`szl_be_hardening.py`, `szl_evidence_research.py`). **These have now been
+reconciled** (Wave-E dev 5) — see
+[Drift reconciliation](#drift-reconciliation-wave-e-dev-5) below. Three were
+reconciled to a single canonical copy and extracted into the package; `serve.py`
+is the per-app entrypoint and is **not** a shared module (its divergence is
+legitimate), so it stays per-app and is reclassified accordingly.
 
 ## Tier definitions (extraction-safety)
 
@@ -95,9 +99,32 @@ is a drifted file, none is M/L:
   from the apps; killinchu is untouched, so the a11oy↔killinchu drift guard stays
   green.**
 
+## Drift reconciliation (Wave-E dev 5)
+
+The 4 files flagged as **DRIFTED** were inspected line-by-line across both repos.
+The drift fell into two categories — **accidental** (a fix or asset landed in one
+app only: the exact "fixed-in-one-app-only" risk this package exists to kill) and
+**legitimate per-app divergence** (config or app-specific content). Each was
+handled honestly, without fabricating data:
+
+| File | Nature of drift | Canonical decision |
+|------|-----------------|--------------------|
+| `_vendor_blobs.py` | **Accidental.** a11oy carries **63** base64 asset blobs; killinchu carries only **21**. killinchu's set is a **strict subset** — every shared key is byte-identical (verified by decode+compare); killinchu is simply missing the two UI fonts (SpaceGrotesk, JetBrainsMono) and all KaTeX `.ttf`/`.woff` fallbacks. | **a11oy (superset).** Extracted byte-identical. killinchu converges *up* to the superset; the extra fonts are unused where a route doesn't serve them — a harmless no-op. |
+| `szl_be_hardening.py` | **Mixed.** The rate-limit exempt route lists are app-specific (a11oy `/frontier,/warhacker,…`; killinchu `/drones,/navy,/api/killinchu/…`). But a11oy also carried an **SEC-08 `Server` header redaction** (`resp.headers["Server"]="szl"`) that killinchu had **dropped** — accidental loss of a security fix. | **Reconciled UNION.** Exempt-exact + exempt-prefix sets are the union of both apps' routes (exempting a route an app doesn't define is a no-op); the metered data surface adds killinchu's `/mesh/*`; and the **SEC-08 header is restored** so both apps get the fix. |
+| `szl_evidence_research.py` | **Mixed.** killinchu's `CLAIMS` map is a **superset** (adds `finance-live-feeds`, `real-estate-grounding`, `fraud-controls` — all citing real, resolvable sources). The only other delta is the OpenAlex polite-pool contact default (`_MAILTO`): a11oy → `a-11-oy.com`, killinchu → `a11oy.net` (each correct for its own site per Doctrine). | **killinchu (superset claims)** with `_MAILTO` defaulting to the **canonical org domain** `research@a-11-oy.com`, still overridable per-deployment via `SZL_EVIDENCE_MAILTO` (killinchu keeps `a11oy.net` that way). No claim or URL was invented. |
+| `serve.py` | **Legitimate.** ~15k lines differ: a11oy is the "Brand Orchestration Layer" React-SPA server; killinchu is the "Andean Drone Intelligence" server. These are **two different applications** that happen to share a filename. | **Not a shared module.** `serve.py` stays per-app (it was already L-tier "never move"). Its drift flag is removed — there is nothing to reconcile into a shared copy. |
+
+The three reconciled modules are eager-imported from `szl_substrate/__init__.py`
+(pure-stdlib at module scope; their `szl_dsse`/app-specific imports are lazy +
+guarded inside functions, so package import never fails). Apps adopt them through
+the same guarded shim as every other module — prefer the package, fall back to the
+local vendored copy. Coverage: `tests/test_mtier_reconcile.py`.
+
 ## Recommended rollout order
 
-1. **Reconcile the 4 drifted files** to one canonical copy (out of band).
+1. ~~**Reconcile the 4 drifted files** to one canonical copy (out of band).~~
+   **DONE (Wave-E dev 5)** — 3 reconciled + extracted here; `serve.py` reclassified
+   as per-app (never shared). See [Drift reconciliation](#drift-reconciliation-wave-e-dev-5).
 2. **Land all 36 S modules** into the package (leaves — no ordering constraints),
    with per-call-site guarded shims in each app.
 3. **Land the 30 M modules in dependency order** — a module moves only after
@@ -180,19 +207,19 @@ Legend: `used by N app + M shared file(s)` = reverse coupling (blast radius).
 | 54 | `szl_waqay.py` | **M** | imports shared: szl_dsse, szl_restraint; used by 1 app + 1 shared file(s) |
 | 55 | `szl_yupay.py` | **M** | imports shared: szl_dsse, szl_restraint; used by 1 app + 0 shared file(s) |
 | 56 | `a11oy_code_engine.py` | **M** | imports shared: szl_agentic_loop, szl_llm_registry; used by 2 app + 1 shared file(s) |
-| 57 | `_vendor_blobs.py` | **M** | leaf: no local imports; used by 0 app + 1 shared file(s); **DRIFTED between repos — reconcile first** |
+| 57 | `_vendor_blobs.py` | **M** | leaf: no local imports; used by 0 app + 1 shared file(s); ✅ **RECONCILED + MOVED (Wave-E dev 5)** — canonical = a11oy superset (63 blobs) |
 | 58 | `a11oy_autoreview.py` | **M** | imports shared: szl_calibration, szl_conformal, szl_restraint; used by 0 app + 1 shared file(s) |
-| 59 | `szl_evidence_research.py` | **M** | leaf: no local imports; used by 0 app + 1 shared file(s); **DRIFTED between repos — reconcile first** |
+| 59 | `szl_evidence_research.py` | **M** | leaf: no local imports; used by 0 app + 1 shared file(s); ✅ **RECONCILED + MOVED (Wave-E dev 5)** — canonical = killinchu superset claims + canonical-domain mailto (env-overridable) |
 | 60 | `szl_unay_routes.py` | **M** | imports shared: szl_khipu_lmdb, szl_khipu_replicate, szl_unay; used by 0 app + 1 shared file(s) |
 | 61 | `a11oy_org_rag.py` | **M** | imports shared: szl_brain, szl_rag, szl_waqay; used by 3 app + 1 shared file(s) |
 | 62 | `a11oy_agent_loop.py` | **M** | imports shared: szl_brain; imports app-specific (lazy/guarded): a11oy_active_flux_router; used by 2 app + 0 shared file(s) |
 | 63 | `szl_live_wires.py` | **M** | imports app-specific (lazy/guarded): szl_jack, szl_wire; used by 0 app + 1 shared file(s) |
 | 64 | `szl_energy_sovereign.py` | **M** | imports shared: szl_joules_truth; imports app-specific (lazy/guarded): a11oy_code_orchestrator, szl_energy_operator; used by 4 app + 3 shared file(s) |
-| 65 | `szl_be_hardening.py` | **M** | imports shared: szl_dsse; imports app-specific (lazy/guarded): szl_cheapest_watt, szl_energy_operator; used by 0 app + 1 shared file(s); **DRIFTED between repos — reconcile first** |
+| 65 | `szl_be_hardening.py` | **M** | imports shared: szl_dsse (lazy/guarded); imports app-specific (lazy/guarded): szl_cheapest_watt, szl_energy_operator; used by 0 app + 1 shared file(s); ✅ **RECONCILED + MOVED (Wave-E dev 5)** — canonical = union of exempt routes + restored SEC-08 Server redaction |
 | 66 | `szl_agentic_loop.py` | **M** | imports shared: szl_anatomy_routes, szl_energy_sovereign, szl_formula_wiring, szl_khipu_consensus; imports app-specific (lazy/guarded): szl_ltc_dynamics, szl_sgh_scheduler; used by 1 app + 2 shared file(s) |
 | 67 | `szl_joules_truth.py` | **L** | leaf: no local imports; used by 11 app + 2 shared file(s) |
 | 68 | `szl_dsse.py` | **L** | imports app-specific (lazy/guarded): szl_corpus_publish; used by 23 app + 10 shared file(s) ✅ **MOVED (this pass)** |
-| 69 | `serve.py` | **L** | imports 37 shared modules; imports 120 app-specific modules (lazy/guarded); used by 1 app + 2 shared file(s); **DRIFTED between repos — reconcile first** |
+| 69 | `serve.py` | **L** | imports 37 shared modules; imports 120 app-specific modules (lazy/guarded); used by 1 app + 2 shared file(s); **PER-APP ENTRYPOINT — never shared.** Drift is legitimate (a11oy Brand-Orchestration vs killinchu Drone-Intelligence are different apps); reconciliation = keep per-app (Wave-E dev 5) |
 
 ---
 

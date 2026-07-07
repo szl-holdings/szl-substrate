@@ -73,6 +73,16 @@ from . import szl_metrics_prom  # noqa: E402,F401
 from . import szl_neuroplasticity  # noqa: E402,F401
 from . import szl_scaling  # noqa: E402,F401
 
+# M-tier reconciled drift (Wave-E dev 5): the 3 shared files that had DRIFTED
+# between a11oy and killinchu, reconciled to a single canonical copy here. All
+# three are pure-stdlib at module scope (their szl_dsse / app-specific imports are
+# lazy + guarded inside functions), so they are safe to eager-import. See
+# MIGRATION.md for the per-file reconciliation decision. serve.py is intentionally
+# NOT extracted — it is the per-app entrypoint (legitimately divergent, L-tier).
+from . import _vendor_blobs  # noqa: E402,F401
+from . import szl_be_hardening  # noqa: E402,F401
+from . import szl_evidence_research  # noqa: E402,F401
+
 # Convenience re-exports of the most commonly used entry points. These are the
 # stable public surface the apps import through the guarded shim.
 from .szl_dsse import (  # noqa: E402,F401
@@ -109,6 +119,10 @@ __all__ = [
     "szl_neuroplasticity",
     "szl_scaling",
     # Wave-S batch (lazy — import directly): szl_connectors_serve
+    # M-tier reconciled drift (Wave-E dev 5)
+    "szl_be_hardening",
+    "szl_evidence_research",
+    # _vendor_blobs is underscore-private but ships as an importable submodule
     # dsse
     "sign_payload",
     "verify_envelope",
