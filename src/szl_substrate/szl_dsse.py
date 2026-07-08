@@ -201,14 +201,30 @@ def verify_envelope(env: dict[str, Any]) -> dict[str, Any]:
     out: dict[str, Any] = {"keyid_expected": KEYID, "pub_fingerprint_sha256": public_key_fingerprint(),
                            "verify_key_url": PUB_KEY_URL}
     try:
+        # Fail closed on a malformed envelope SHAPE before touching any crypto.
+        # A verifier must never trust a signature it cannot even parse; every
+        # branch below returns verified=False with a specific reason instead of
+        # relying on the catch-all except (which reported a generic error and
+        # aborted verification of the whole envelope on the FIRST bad entry).
+        if not isinstance(env, dict):
+            return {**out, "verified": False, "reason": "envelope is not a JSON object"}
         payload_b64 = env.get("payload")
         payload_type = env.get("payloadType")
-        sigs = env.get("signatures") or []
+        raw_sigs = env.get("signatures")
         if not payload_b64 or not payload_type:
             return {**out, "verified": False, "reason": "missing payload/payloadType"}
-        if not sigs:
+        if not isinstance(payload_b64, str) or not isinstance(payload_type, str):
+            return {**out, "verified": False, "reason": "payload/payloadType wrong type"}
+        # None or [] => honest unsigned envelope; a non-list is a malformed shape.
+        if raw_sigs is None or (isinstance(raw_sigs, list) and not raw_sigs):
             return {**out, "verified": False, "reason": "no signatures (unsigned envelope)"}
-        body = base64.b64decode(payload_b64)
+        if not isinstance(raw_sigs, list):
+            return {**out, "verified": False, "reason": "signatures is not a list"}
+        sigs = raw_sigs
+        try:
+            body = base64.b64decode(payload_b64, validate=True)
+        except Exception:
+            return {**out, "verified": False, "reason": "payload is not valid base64"}
         to_verify = pae(payload_type, body)
         out["pae_sha256"] = hashlib.sha256(to_verify).hexdigest()
         pub = _load_public_key()
@@ -218,6 +234,13 @@ def verify_envelope(env: dict[str, Any]) -> dict[str, Any]:
         results = []
         any_ok = False
         for s in sigs:
+            # A non-object signature entry can never carry a valid signature —
+            # record it as failed and keep checking the rest (a malformed
+            # sibling must not abort verification of a genuine signature).
+            if not isinstance(s, dict):
+                results.append({"keyid": None, "verified": False,
+                                "reason": "signature entry is not an object"})
+                continue
             sig_b64 = s.get("sig", "")
             keyid = s.get("keyid", "")
             try:
