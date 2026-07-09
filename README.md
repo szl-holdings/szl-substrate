@@ -81,6 +81,31 @@ except Exception:                                         # pragma: no cover
 This proves the extraction pattern end-to-end **without risking either running
 application**. See the proof-of-concept PR referenced in `MIGRATION.md`.
 
+## The Ouroboros loop (what the shared agent-loop modules are)
+
+Beyond the three guarded-import extraction modules above, `src/szl_substrate/` also
+carries the estate's shared **governed agent-loop** modules that a11oy and killinchu run
+byte-identically:
+
+| Module | What it is (from its own header) |
+|--------|----------------------------------|
+| `szl_agentic_loop.py` | "THE OPERATIONAL GOVERNED AGENT LOOP" — makes the advertised **RAG → tool-call → policy/trust gate → signed receipt** loop REAL and CLICKABLE end-to-end, with a per-hop trace and a re-verifiable chained, signed receipt. |
+| `a11oy_agent_loop.py` | "a GENUINELY agentic, governed finite-state machine": `INTAKE → PLAN → RETRIEVE → ACT → OBSERVE → VERIFY → (REFLECT → ACT) → FINALIZE`, with bounded guards `max_steps=12`, `max_reflect_depth=3`, Λ-floor `0.90` **fail-closed**, and a conformal floor `1/(n+1)` (trust is never 100%). |
+
+These are the estate's concrete instances of the **Ouroboros bounded-recursion loop**.
+The canonical definition is the receipt-closed kernel
+[`szl-holdings/ouroboros` → `src/loop-kernel.ts`](https://github.com/szl-holdings/ouroboros/blob/main/src/loop-kernel.ts)
+(`runLoop`): *bounded recursion with measurable convergence* that MUST terminate on one
+of `converged | consistent | aborted | budgetExhausted` and emits a governance receipt
+— **the trace is the product**.
+
+**Metaphor (doctrine, not math):** `receipts.in ≡ receipts.out` — the snake eats its own
+tail; each run's signed receipt is fed back as an auditable input.
+
+**Honesty (Doctrine v11):** every loop here is **bounded and terminating** (explicit step
+budgets, fail-closed gates) — there is **no** perpetual-motion or zero-cost claim. Λ is
+**Conjecture 1** (advisory), never a proven theorem.
+
 ## Honesty labels
 
 - **Λ = Conjecture 1** — advisory only. Never rendered as "green"/"proven"/a theorem.
