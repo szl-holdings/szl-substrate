@@ -24,11 +24,19 @@ apps then `import` from the package instead of maintaining local copies.
 
 ## What is here today (honest scope)
 
-This is the **first, deliberately small** extraction pass — **3 of 69** modules,
-chosen for lowest coupling and highest shared value. **This is not a big-bang
-cutover.** The apps still keep their local copies and import from the package
-only through a **guarded shim with fallback to local**, so nothing breaks if the
-package is not installed in a given environment.
+Extraction is now **functionally complete for the movable universe**: **68 of
+the 69** shared modules have been migrated into the package — **98.6%** of the
+raw 69-file shared set (100% of the 68 modules that are actually movable; the
+69th file, `serve.py`, is the per-app entrypoint and is L-tier "never move" by
+design — see [`MIGRATION.md`](MIGRATION.md) for the full wave-by-wave
+breakdown). **This was not a big-bang cutover.** The apps still keep their
+local copies and import from the package only through a **guarded shim with
+fallback to local**, so nothing breaks if the package is not installed in a
+given environment.
+
+The original proof-of-concept batch (the first 3 modules extracted, before the
+remaining waves landed) established the pattern this package now uses
+throughout:
 
 | Module | What it does | Third-party deps | Coupling |
 |--------|--------------|------------------|----------|
@@ -36,9 +44,11 @@ package is not installed in a given environment.
 | `szl_dsse` | DSSE (in-toto) ECDSA-P256-SHA256 signing/verify, cosign-compatible, UNSIGNED-honest fallback | `cryptography` | leaf (one lazy, guarded, optional hook into `szl_corpus_publish`) |
 | `szl_brain` | Governed reasoning-brain scaffolding: Λ aggregator (advisory) + trust→tier policy | none (pure-Python) | leaf (one lazy, guarded, optional call into `szl_rag`) |
 
-Every module here is **byte-identical** to the copy that ships in a11oy and
-killinchu as of extraction (verified with `cmp`). Extraction did not change a
-single line of module logic.
+Every module in the package — all 68 — is **byte-identical** to the copy that
+ships in a11oy and killinchu as of its extraction (verified with `cmp`).
+Extraction did not change a single line of module logic. See
+[`MIGRATION.md`](MIGRATION.md) for the full ranked table of all 69 files and
+which wave moved each one.
 
 ## Install
 
