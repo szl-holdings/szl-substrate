@@ -74,7 +74,6 @@ import json
 import math
 import os
 import re
-import resource
 import subprocess
 import sys
 import tempfile
@@ -82,6 +81,11 @@ import time
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Optional
+
+try:
+    import resource as _resource
+except ImportError:  # Windows has no POSIX rlimit implementation.
+    _resource = None
 
 # ---- reuse the PROVEN loop primitives (single source of truth for chain semantics)
 try:
@@ -438,17 +442,26 @@ def _sandbox_exec(code: str, lang: str = "python", timeout_s: int = 6,
         return {"ok": False, "error": "only python is sandboxed in this build",
                 "stdout": "", "stderr": "unsupported language: %s" % lang, "exit": -1,
                 "isolation": "n/a"}
+    if os.name != "posix" or _resource is None:
+        return {
+            "ok": False,
+            "error": "sandbox unavailable: POSIX resource limits are required",
+            "stdout": "",
+            "stderr": "execution denied because rlimits cannot be enforced",
+            "exit": -1,
+            "isolation": "unavailable (fail closed: POSIX rlimits required)",
+        }
 
     def _limits():
         # child-only resource limits (POSIX). Applied in the forked child pre-exec.
         try:
-            resource.setrlimit(resource.RLIMIT_CPU, (timeout_s, timeout_s))
+            _resource.setrlimit(_resource.RLIMIT_CPU, (timeout_s, timeout_s))
             soft = mem_mb * 1024 * 1024
-            resource.setrlimit(resource.RLIMIT_AS, (soft, soft))
-            resource.setrlimit(resource.RLIMIT_CORE, (0, 0))
-            resource.setrlimit(resource.RLIMIT_FSIZE, (0, 0))   # no file writes
+            _resource.setrlimit(_resource.RLIMIT_AS, (soft, soft))
+            _resource.setrlimit(_resource.RLIMIT_CORE, (0, 0))
+            _resource.setrlimit(_resource.RLIMIT_FSIZE, (0, 0))   # no file writes
             try:
-                resource.setrlimit(resource.RLIMIT_NPROC, (0, 0))  # no new processes
+                _resource.setrlimit(_resource.RLIMIT_NPROC, (0, 0))  # no new processes
             except Exception:
                 pass
         except Exception:
