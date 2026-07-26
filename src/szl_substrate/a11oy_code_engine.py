@@ -74,7 +74,6 @@ import json
 import math
 import os
 import re
-import resource
 import subprocess
 import sys
 import tempfile
@@ -82,6 +81,11 @@ import time
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Optional
+
+try:
+    import resource as _resource
+except ImportError:  # Windows has no POSIX rlimit implementation.
+    _resource = None
 
 # ---- reuse the PROVEN loop primitives (single source of truth for chain semantics)
 try:
@@ -437,18 +441,28 @@ def _sandbox_exec(code: str, lang: str = "python", timeout_s: int = 6,
     if lang != "python":
         return {"ok": False, "error": "only python is sandboxed in this build",
                 "stdout": "", "stderr": "unsupported language: %s" % lang, "exit": -1,
-                "isolation": "n/a"}
+                "isolation": "n/a", "execution_attempted": False}
+    if os.name != "posix" or _resource is None:
+        return {
+            "ok": False,
+            "error": "sandbox unavailable: POSIX resource limits are required",
+            "stdout": "",
+            "stderr": "execution denied because rlimits cannot be enforced",
+            "exit": -1,
+            "isolation": "unavailable (fail closed: POSIX rlimits required)",
+            "execution_attempted": False,
+        }
 
     def _limits():
         # child-only resource limits (POSIX). Applied in the forked child pre-exec.
         try:
-            resource.setrlimit(resource.RLIMIT_CPU, (timeout_s, timeout_s))
+            _resource.setrlimit(_resource.RLIMIT_CPU, (timeout_s, timeout_s))
             soft = mem_mb * 1024 * 1024
-            resource.setrlimit(resource.RLIMIT_AS, (soft, soft))
-            resource.setrlimit(resource.RLIMIT_CORE, (0, 0))
-            resource.setrlimit(resource.RLIMIT_FSIZE, (0, 0))   # no file writes
+            _resource.setrlimit(_resource.RLIMIT_AS, (soft, soft))
+            _resource.setrlimit(_resource.RLIMIT_CORE, (0, 0))
+            _resource.setrlimit(_resource.RLIMIT_FSIZE, (0, 0))   # no file writes
             try:
-                resource.setrlimit(resource.RLIMIT_NPROC, (0, 0))  # no new processes
+                _resource.setrlimit(_resource.RLIMIT_NPROC, (0, 0))  # no new processes
             except Exception:
                 pass
         except Exception:
@@ -482,6 +496,7 @@ def _sandbox_exec(code: str, lang: str = "python", timeout_s: int = 6,
             err = (proc.stderr or "")[:4000]
             return {"ok": proc.returncode == 0, "stdout": out, "stderr": err,
                     "exit": proc.returncode, "elapsed_ms": dt,
+                    "execution_attempted": True,
                     "isolation": ("sandboxed (restricted subprocess): separate process, "
                                   "CPU+memory+fsize+nproc rlimits, network disabled, %ss "
                                   "wall-clock timeout, minimal env. Full seccomp/container "
@@ -489,10 +504,12 @@ def _sandbox_exec(code: str, lang: str = "python", timeout_s: int = 6,
         except subprocess.TimeoutExpired:
             return {"ok": False, "stdout": "", "stderr": "timeout after %ss (killed)" % timeout_s,
                     "exit": -9, "elapsed_ms": round((time.time() - t0) * 1000, 1),
+                    "execution_attempted": True,
                     "isolation": "sandboxed (restricted subprocess) — timed out and killed"}
         except Exception as e:
             return {"ok": False, "stdout": "", "stderr": "sandbox error: %s" % e,
                     "exit": -1, "elapsed_ms": round((time.time() - t0) * 1000, 1),
+                    "execution_attempted": False,
                     "isolation": "sandboxed (restricted subprocess)"}
 
 
@@ -982,12 +999,23 @@ def governed_turn(mode: str, prompt: str, sign_fn, ns: str,
 
     # ---- SANDBOX EXEC (only for code, only on ALLOW, between gate and emit) ----
     sandbox_result = None
+    sandbox_refused = False
     if mode == "code" and sandbox:
         if allowed:
             sandbox_result = _sandbox_exec(code_blob["code"], lang=code_blob["language"])
+            sandbox_refused = sandbox_result.get("execution_attempted") is False
+            if sandbox_refused:
+                refusal_detail = (sandbox_result.get("error") or
+                                  "sandbox refused execution before a child process started")
+                # Replace rather than mutate: the earlier policy receipt already
+                # hashed the original reasons list.
+                reasons = reasons + ["sandbox execution refused: %s" % refusal_detail]
+                allowed = False
+                decision = "DENY"
         else:
             sandbox_result = {"ok": False, "stdout": "", "stderr": "",
                               "exit": None, "blocked": True,
+                              "execution_attempted": False,
                               "isolation": "not executed — blocked at the gate (gate soundness)"}
 
     # ---- HOP 6: emit (+ sign the final receipt) -------------------------------
@@ -1011,6 +1039,12 @@ def governed_turn(mode: str, prompt: str, sign_fn, ns: str,
         "gate_reasons": reasons, "chain_final_hash": prev_hash, "chain_depth": len(chain),
         "emitted": effect["emitted"], "issuer": ns,
         "sandbox_exit": (sandbox_result or {}).get("exit") if sandbox_result else None,
+        "sandbox_ok": (sandbox_result or {}).get("ok") if sandbox_result else None,
+        "sandbox_execution_attempted": (
+            (sandbox_result or {}).get("execution_attempted") if sandbox_result else None
+        ),
+        "sandbox_refused": sandbox_refused,
+        "sandbox_error": (sandbox_result or {}).get("error") if sandbox_result else None,
         "issued_at": datetime.now(timezone.utc).isoformat(),
     }
     # Wave G: fold the OPTIONAL harness profile provenance into the SIGNED payload
@@ -1038,7 +1072,12 @@ def governed_turn(mode: str, prompt: str, sign_fn, ns: str,
                         "payloadType": "application/vnd.szl.receipt+json"}
     _chain_receipt("emit", {"decision": decision, "emitted": effect["emitted"],
                             "signed": bool(envelope_sig.get("signed")),
-                            "sandbox_exit": (sandbox_result or {}).get("exit") if sandbox_result else None})
+                            "sandbox_exit": (sandbox_result or {}).get("exit") if sandbox_result else None,
+                            "sandbox_execution_attempted": (
+                                (sandbox_result or {}).get("execution_attempted")
+                                if sandbox_result else None
+                            ),
+                            "sandbox_refused": sandbox_refused})
 
     run_chain.append({"run_id": run_id, "final_hash": prev_hash,
                       "prev_run_hash": prev_run_hash, "decision": decision})
@@ -1057,6 +1096,10 @@ def governed_turn(mode: str, prompt: str, sign_fn, ns: str,
         why = "; ".join(reasons) if reasons else ("advisory trust %.2f below floor" % trust)
         summ = ("Blocked. The gate denied this because: %s. Nothing was emitted — only a signed deny "
                 "receipt. This is the governance working." % why)
+    if sandbox_refused:
+        why = "; ".join(reasons)
+        summ = ("Blocked. The sandbox refused execution before a child process started because: %s. "
+                "No code ran and nothing was emitted; only a signed deny receipt was produced." % why)
 
     return {
         "run_id": run_id, "mode": mode, "decision": decision, "emitted": effect["emitted"],
@@ -1077,6 +1120,13 @@ def governed_turn(mode: str, prompt: str, sign_fn, ns: str,
                                "non-interference (P3): it cannot change the verdict.")},
         "gate": {"name": "deny-by-default safety gate", "allow": gate_allow, "reasons": reasons,
                  "severity": severity, "static_screen": static},
+        "execution_admission": {
+            "allowed": allowed,
+            "attempted": ((sandbox_result or {}).get("execution_attempted")
+                          if sandbox_result else None),
+            "refused": sandbox_refused,
+            "reason": ((sandbox_result or {}).get("error") if sandbox_refused else None),
+        },
         "trust": {"score": trust, "floor": trust_floor, "pass": trust_pass, "axes": axes,
                   "status": "Trust score (advisory) — research conjecture (Conjecture 1), not a proven oracle"},
         "receipt_chain": chain, "signed_receipt": envelope_sig,
