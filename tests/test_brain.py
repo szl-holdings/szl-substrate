@@ -4,7 +4,6 @@
 Λ is Conjecture 1 (advisory) — these tests check the geometric-mean aggregator
 and the trust→tier routing, NOT any claim of proven trust.
 """
-import math
 
 from szl_substrate import szl_brain as brain
 
