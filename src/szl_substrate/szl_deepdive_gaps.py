@@ -33,7 +33,6 @@ import hashlib
 import json
 import os
 import sys
-import uuid
 from datetime import datetime, timezone
 from typing import Any
 
@@ -580,7 +579,6 @@ def register(app: FastAPI, flagship: str) -> dict:
             return JSONResponse(result)
         registered.append(f"{prefix}/geofence")
 
-    import sys
     print(f"[szl_deepdive_gaps] {flagship}: {len(registered)} Series-A gap endpoints registered", file=sys.stderr)
     return {"flagship": flagship, "routes_registered": registered}
 

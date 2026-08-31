@@ -24,7 +24,7 @@ brain-jack receipts. Empty buffer ⇒ idle wire (no pulse). NO mocks, NO fabrica
 Signatures are honestly labelled PLACEHOLDER until Sigstore CI is wired.
 """
 from __future__ import annotations
-import json, time, hashlib, os, asyncio
+import json, time, hashlib, asyncio
 from collections import deque
 from datetime import datetime, timezone
 from pathlib import Path

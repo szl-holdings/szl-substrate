@@ -6,7 +6,6 @@ the honest-unsigned path. The module must NEVER fabricate a signature.
 """
 import base64
 import json
-import os
 
 import pytest
 
