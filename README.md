@@ -50,6 +50,18 @@ Extraction did not change a single line of module logic. See
 [`MIGRATION.md`](MIGRATION.md) for the full ranked table of all 69 files and
 which wave moved each one.
 
+## Absorbed modules
+
+szl-substrate is the designated canonical absorber for three archived repos —
+the archived repos point here (repo-level metadata, set at archive time
+2026-08-29: "Canonical: szl-holdings/szl-substrate"):
+
+| Archived repo | What it owned | Pointer evidence |
+|---|---|---|
+| [`vsp-otel`](https://github.com/szl-holdings/vsp-otel) | Λ-signed OpenTelemetry exporter (Layer-4 Λ-gate exporter) for SZL audit fibers | Archived 2026-08-29; repo description names szl-substrate canonical |
+| [`szl-telemetry`](https://github.com/szl-holdings/szl-telemetry) | Daily public-API telemetry snapshots of the SZLHOLDINGS Hugging Face estate | Archived 2026-08-29; repo description names szl-substrate canonical |
+| [`szl-mesh`](https://github.com/szl-holdings/szl-mesh) | Doctrine-pinned mesh coordination — DSSE receipt chains over CRDT fleet state | Archived 2026-08-29; repo description names szl-substrate canonical |
+
 ## Install
 
 ```bash
