@@ -516,7 +516,7 @@ def register(app: FastAPI, flagship: str) -> dict:
             geofence_radius_m = float(body.get("geofence_radius_m", 500))
             lat = float(telemetry.get("lat", 0))
             lon = float(telemetry.get("lon", 0))
-            alt_m = float(telemetry.get("alt_m", 0))
+            _ = float(telemetry.get("alt_m", 0))
             speed_ms = float(telemetry.get("speed_ms", 0))
             import math
             dist_from_center = math.sqrt(lat**2 + lon**2) * 111000  # rough meters

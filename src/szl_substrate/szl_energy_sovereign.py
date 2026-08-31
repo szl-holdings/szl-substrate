@@ -390,7 +390,7 @@ def energy_fields_for_receipt() -> dict:
         prom = _parse_prom(_fetch_metrics_text() or "")
         sample = _exporter_sample_from_metrics(prom)
         jt = _jtoken_from_metrics(prom, sample)
-        gen_tokens = jt.get("generated_tokens_total")
+        _ = jt.get("generated_tokens_total")
         jpt = jt.get("joules_per_token")
         # Per-receipt instantaneous reading: total measured joules is the honest figure;
         # per-token rate is the MEASURED derivation. We report the fresh cumulative joules

@@ -270,7 +270,7 @@ def _boe_pdf_bytes(boe: Dict[str, Any]) -> bytes:
         "Signed: Yachay  |  Perplexity Computer Agent",
     ]
     text = "\\n".join(l.replace("(", "\\(").replace(")", "\\)") for l in lines)
-    stream = f"BT /F1 9 Tf 40 760 Td 12 TL ({text.splitlines()[0] if False else ''}) Tj".encode()
+    _ = f"BT /F1 9 Tf 40 760 Td 12 TL ({text.splitlines()[0] if False else ''}) Tj".encode()
     # build a simple multiline PDF
     body_ops = "BT /F1 9 Tf 40 770 Td 12 TL "
     for l in lines:
