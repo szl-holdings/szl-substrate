@@ -17,7 +17,7 @@ distribution) and computes:
         BS = (1/N) Σ_i Σ_k (p_ik − y_ik)^2
 
 Source formulas: ECE/Brier arXiv:2605.21566 (and arXiv:2505.15437). Pure-Python,
-no numpy — ships byte-identical into both images.
+no numpy. Consumer updates require separate source and runtime qualification.
 
 The GATE
 --------
@@ -40,6 +40,7 @@ Co-Authored-By: Perplexity Computer Agent <agent@perplexity.ai>
 """
 from __future__ import annotations
 
+import math
 import os
 import threading
 from collections import deque
@@ -51,25 +52,67 @@ DEFAULT_BINS = 10
 WINDOW = 500                 # rolling window per (model, agent_type)
 
 
-def _gate_threshold() -> float:
-    try:
-        return float(os.environ.get("A11OY_ECE_GATE_THRESHOLD", str(DEFAULT_ECE_GATE)))
-    except (TypeError, ValueError):
+def _gate_threshold() -> Optional[float]:
+    """Use the default only when unset; malformed policy cannot grant approval."""
+    raw = os.environ.get("A11OY_ECE_GATE_THRESHOLD")
+    if raw is None:
         return DEFAULT_ECE_GATE
+    try:
+        threshold = float(raw)
+    except (TypeError, ValueError, OverflowError):
+        return None
+    return threshold if math.isfinite(threshold) and 0.0 <= threshold <= 1.0 else None
+
+
+def _probability(value: float) -> float:
+    """Reject invalid observations instead of clamping/coercing them to evidence."""
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise ValueError("probability must be a finite number in [0, 1]")
+    try:
+        result = float(value)
+    except (ValueError, OverflowError) as error:
+        raise ValueError("probability must be a finite number in [0, 1]") from error
+    if not math.isfinite(result) or not 0.0 <= result <= 1.0:
+        raise ValueError("probability must be a finite number in [0, 1]")
+    return result
+
+
+def _positive_integer(value: int, name: str) -> int:
+    if type(value) is not int or value <= 0:
+        raise ValueError(f"{name} must be a positive integer")
+    return value
+
+
+def _binary_samples(confidences: Sequence[float],
+                    correct: Sequence[bool]) -> tuple[list[float], list[float]]:
+    conf = [_probability(value) for value in confidences]
+    flags = list(correct)
+    if len(conf) != len(flags):
+        raise ValueError("confidence and outcome counts must match")
+    if any(type(flag) is not bool for flag in flags):
+        raise ValueError("correctness must be a boolean, not a truthy value")
+    return conf, [1.0 if flag else 0.0 for flag in flags]
+
+
+def _distribution(probs: Sequence[float], true_index: int) -> list[float]:
+    values = [_probability(value) for value in probs]
+    if not values or sum(values) <= 0:
+        raise ValueError("probability distribution must have positive mass")
+    if type(true_index) is not int or not 0 <= true_index < len(values):
+        raise ValueError("true class index must be an in-range integer")
+    return values
 
 
 def expected_calibration_error(confidences: Sequence[float],
                                correct: Sequence[bool],
                                n_bins: int = DEFAULT_BINS) -> Optional[float]:
     """Equal-width-bin ECE over predicted confidences and correctness flags.
-    Returns None if there are no samples. Never raises."""
-    conf = [min(1.0, max(0.0, float(c))) for c in confidences]
-    cor = [1.0 if bool(b) else 0.0 for b in correct]
-    n = min(len(conf), len(cor))
+    Returns None for empty samples; invalid or unpaired observations raise ValueError."""
+    conf, cor = _binary_samples(confidences, correct)
+    n = len(conf)
     if n == 0:
         return None
-    conf, cor = conf[:n], cor[:n]
-    bins = max(1, int(n_bins))
+    bins = _positive_integer(n_bins, "n_bins")
     ece = 0.0
     for b in range(bins):
         lo = b / bins
@@ -90,16 +133,17 @@ def brier_score(prob_vectors: Sequence[Sequence[float]],
                 true_indices: Sequence[int]) -> Optional[float]:
     """Multiclass Brier score. prob_vectors[i] is the full distribution for
     sample i; true_indices[i] is the index of the true class. None if empty."""
-    n = min(len(prob_vectors), len(true_indices))
+    if len(prob_vectors) != len(true_indices):
+        raise ValueError("distribution and outcome counts must match")
+    n = len(prob_vectors)
     if n == 0:
         return None
     total = 0.0
     for i in range(n):
-        p = [max(0.0, min(1.0, float(v))) for v in prob_vectors[i]]
+        ti = true_indices[i]
+        p = _distribution(prob_vectors[i], ti)
         s = sum(p)
-        if s > 0:
-            p = [v / s for v in p]
-        ti = int(true_indices[i])
+        p = [v / s for v in p]
         acc = 0.0
         for k in range(len(p)):
             y = 1.0 if k == ti else 0.0
@@ -111,9 +155,8 @@ def brier_score(prob_vectors: Sequence[Sequence[float]],
 def brier_binary(confidences: Sequence[float], correct: Sequence[bool]) -> Optional[float]:
     """Binary Brier from a top-class confidence + correctness flag:
        BS = mean( (conf − correct)^2 ). None if empty."""
-    conf = [min(1.0, max(0.0, float(c))) for c in confidences]
-    cor = [1.0 if bool(b) else 0.0 for b in correct]
-    n = min(len(conf), len(cor))
+    conf, cor = _binary_samples(confidences, correct)
+    n = len(conf)
     if n == 0:
         return None
     return round(sum((conf[i] - cor[i]) ** 2 for i in range(n)) / n, 6)
@@ -123,10 +166,9 @@ def reliability_bins(confidences: Sequence[float], correct: Sequence[bool],
                      n_bins: int = DEFAULT_BINS) -> list[dict]:
     """Reliability-diagram data: per equal-width bin, return count, mean
     confidence, and accuracy. Drives the dashboard's calibration curve."""
-    conf = [min(1.0, max(0.0, float(c))) for c in confidences]
-    cor = [1.0 if bool(b) else 0.0 for b in correct]
-    n = min(len(conf), len(cor))
-    bins = max(1, int(n_bins))
+    conf, cor = _binary_samples(confidences, correct)
+    n = len(conf)
+    bins = _positive_integer(n_bins, "n_bins")
     out = []
     for b in range(bins):
         lo, hi = b / bins, (b + 1) / bins
@@ -148,8 +190,8 @@ class CalibrationTracker:
     the automated-response gate live."""
 
     def __init__(self, window: int = WINDOW, n_bins: int = DEFAULT_BINS) -> None:
-        self.window = int(window) if window and window > 0 else WINDOW
-        self.n_bins = int(n_bins) if n_bins and n_bins > 0 else DEFAULT_BINS
+        self.window = _positive_integer(window, "window")
+        self.n_bins = _positive_integer(n_bins, "n_bins")
         self._lock = threading.Lock()
         # key -> deque of {conf, correct, probs, true_idx}
         self._store: dict[tuple, deque] = {}
@@ -161,10 +203,14 @@ class CalibrationTracker:
     def log(self, model: str, agent_type: str, confidence: float, correct: bool,
             probs: Optional[Sequence[float]] = None,
             true_index: Optional[int] = None) -> None:
+        # Validate and copy the complete sample before creating or changing a window.
+        conf, _ = _binary_samples([confidence], [correct])
+        if (probs is None) != (true_index is None):
+            raise ValueError("probabilities and true class index must be supplied together")
+        values = _distribution(probs, true_index) if probs is not None else None
         k = self._key(model, agent_type)
-        rec = {"conf": float(confidence), "correct": bool(correct),
-               "probs": list(probs) if probs is not None else None,
-               "true_idx": (int(true_index) if true_index is not None else None)}
+        rec = {"conf": conf[0], "correct": correct,
+               "probs": values, "true_idx": true_index}
         with self._lock:
             dq = self._store.get(k)
             if dq is None:
@@ -208,8 +254,9 @@ class CalibrationTracker:
             "reliability": reliability_bins(conf, cor, self.n_bins),
             "honesty": ("LIVE ECE (equal-width %d-bin) + Brier over the last %d "
                         "verified predictions. ECE/Brier per arXiv:2605.21566. "
-                        "Lower is better; ECE<%.2f gates automated responses."
-                        % (self.n_bins, n, threshold)),
+                        "Lower is better; ECE<%s gates automated responses."
+                        % (self.n_bins, n,
+                           "INVALID (denied)" if threshold is None else f"{threshold:.2f}")),
         }
 
     def automated_response_gate(self, model: str, agent_type: str) -> dict:
@@ -217,7 +264,13 @@ class CalibrationTracker:
         the (model, agent-type) is measured AND ECE < threshold. Fails CLOSED on
         unmeasured calibration. Coordinate threshold with Dev D."""
         m = self.metrics(model, agent_type)
-        threshold = _gate_threshold()
+        # Bind the decision to the threshold already captured with these metrics.
+        threshold = m["ece_gate_threshold"]
+        if threshold is None:
+            return {"allow": False, "model": m["model"], "agent_type": m["agent_type"],
+                    "ece": m.get("ece"), "threshold": None, "n": m["n"],
+                    "reason": "invalid_threshold",
+                    "honesty": "Gate FAILS CLOSED: invalid calibration threshold configuration."}
         if m["status"] != "measured" or m.get("ece") is None:
             return {"allow": False, "model": m["model"], "agent_type": m["agent_type"],
                     "ece": None, "threshold": threshold, "n": m["n"],
