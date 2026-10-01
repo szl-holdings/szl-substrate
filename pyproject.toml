@@ -29,9 +29,14 @@ dev = [
 [project.urls]
 Homepage = "https://github.com/szl-holdings/szl-substrate"
 Repository = "https://github.com/szl-holdings/szl-substrate"
+Issues = "https://github.com/szl-holdings/szl-substrate/issues"
+Changelog = "https://github.com/szl-holdings/szl-substrate/releases"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/szl_substrate"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+
+[tool.szl.release]
+import_names = ["szl_substrate"] # wheel top-level import names; the release gate fails if the built wheel differs
