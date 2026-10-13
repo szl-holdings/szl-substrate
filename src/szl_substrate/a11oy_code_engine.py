@@ -425,47 +425,145 @@ def hard_security_screen(code: str) -> dict:
             "network_or_fs_attempt": base["network_or_fs_attempt"]}
 
 
+# ---------------------------------------------------------------------------
+# MANDATORY CHILD RLIMITS (fail closed).
+# Every limit below is MANDATORY. If any one of them cannot be applied, the
+# generated code does not run: there is no "run without limits" degraded mode.
+#   - parent-side preflight (_plan_mandatory_rlimits): non-mutating, BEFORE any
+#     process is created. Denies when the resource module, a mandatory RLIMIT_*
+#     constant, getrlimit/setrlimit or RLIM_INFINITY is missing, or when a current
+#     limit cannot be read. It never changes the server process's own limits.
+#   - child-side hook (_apply_mandatory_rlimits): runs as preexec_fn in the forked
+#     child and RAISES on any setrlimit failure or on a limit that is not in effect
+#     when read back. CPython then aborts the child before exec and raises
+#     SubprocessError in the parent, so the generated code never runs; the parent
+#     maps that to the same DENY shape (execution_attempted=False).
+# Honest scope: rlimits + a subprocess + regex screening are resource controls,
+# NOT an OS isolation boundary (no seccomp, namespaces, chroot or container here).
+# ---------------------------------------------------------------------------
+_IS_POSIX = os.name == "posix"
+_MANDATORY_RLIMITS = ("RLIMIT_CPU", "RLIMIT_AS", "RLIMIT_CORE", "RLIMIT_FSIZE", "RLIMIT_NPROC")
+_NO_POSIX_LIMITS_ERROR = "sandbox unavailable: POSIX resource limits are required"
+_LIMIT_HOOK_FAILED_ERROR = ("sandbox unavailable: a mandatory rlimit could not be applied in the "
+                            "child before exec (preexec limit hook failed); the code never ran")
+
+
+def _sandbox_denied(error: str, isolation: str,
+                    stderr: str = "execution denied because mandatory rlimits cannot be enforced",
+                    elapsed_ms=None) -> dict:
+    """The sandbox DENY shape: nothing executed, with a precise reason."""
+    out = {"ok": False, "error": error, "stdout": "", "stderr": stderr,
+           "exit": -1, "isolation": isolation, "execution_attempted": False}
+    if elapsed_ms is not None:
+        out["elapsed_ms"] = elapsed_ms
+    return out
+
+
+def _rlim_stricter(a, b, inf):
+    """The stricter (lower) of two rlimit values; RLIM_INFINITY means no limit."""
+    if a == inf:
+        return b
+    if b == inf:
+        return a
+    return min(a, b)
+
+
+def _rlim_within(actual, wanted, inf) -> bool:
+    """True when `actual` is at least as strict as `wanted`."""
+    if wanted == inf:
+        return True
+    if actual == inf:
+        return False
+    return actual <= wanted
+
+
+def _plan_mandatory_rlimits(timeout_s: int, mem_mb: int):
+    """Parent-side preflight for the mandatory child rlimits. NON-MUTATING: it only
+    reads the current limits and never calls setrlimit on the server process.
+
+    Returns (resource_module, plan, None) on success or (None, None, reason) when a
+    mandatory limit cannot be enforced. `plan` is [(name, rid, (soft, hard)), ...];
+    each value is the strictest of the mandated value and the inherited limits, so
+    the child's setrlimit is always a permitted lowering and never weaker than
+    either the mandate or what the server process already had."""
+    res = _resource
+    if not _IS_POSIX or res is None:
+        return None, None, _NO_POSIX_LIMITS_ERROR
+    for fn in ("getrlimit", "setrlimit"):
+        if not callable(getattr(res, fn, None)):
+            return None, None, ("sandbox unavailable: resource.%s is unavailable, so mandatory "
+                                "rlimits cannot be enforced" % fn)
+    inf = getattr(res, "RLIM_INFINITY", None)
+    if inf is None:
+        return None, None, ("sandbox unavailable: resource.RLIM_INFINITY is unavailable, so "
+                            "mandatory rlimits cannot be planned")
+    mem = int(mem_mb) * 1024 * 1024
+    mandated = {"RLIMIT_CPU": (int(timeout_s), int(timeout_s)),
+                "RLIMIT_AS": (mem, mem),
+                "RLIMIT_CORE": (0, 0),     # no core dump
+                "RLIMIT_FSIZE": (0, 0),    # no file writes
+                "RLIMIT_NPROC": (0, 0)}    # no new processes
+    plan = []
+    for name in _MANDATORY_RLIMITS:
+        rid = getattr(res, name, None)
+        if rid is None:
+            return None, None, ("sandbox unavailable: mandatory rlimit %s is not supported on "
+                                "this platform" % name)
+        try:
+            cur_soft, cur_hard = res.getrlimit(rid)
+        except Exception as e:
+            return None, None, ("sandbox unavailable: mandatory rlimit %s cannot be read (%s)"
+                                % (name, type(e).__name__))
+        soft, hard = mandated[name]
+        eff_hard = _rlim_stricter(hard, cur_hard, inf)
+        eff_soft = _rlim_stricter(_rlim_stricter(soft, cur_soft, inf), eff_hard, inf)
+        plan.append((name, rid, (eff_soft, eff_hard)))
+    return res, plan, None
+
+
+def _apply_mandatory_rlimits(res, plan) -> None:
+    """Child-side preexec hook. Applies EVERY planned limit and reads it back.
+    Raises on any failure and NEVER swallows one: CPython then aborts the child
+    before exec, so the generated code never runs without its limits."""
+    inf = res.RLIM_INFINITY
+    for name, rid, (soft, hard) in plan:
+        res.setrlimit(rid, (soft, hard))
+        got_soft, got_hard = res.getrlimit(rid)
+        if not (_rlim_within(got_soft, soft, inf) and _rlim_within(got_hard, hard, inf)):
+            raise OSError("mandatory rlimit %s is not in effect after setrlimit" % name)
+
+
 def _sandbox_exec(code: str, lang: str = "python", timeout_s: int = 6,
                   mem_mb: int = 256) -> dict:
-    """Execute agent-generated code in an ISOLATED restricted subprocess.
-    Isolation applied (honest):
+    """Execute agent-generated code in a restricted subprocess.
+    Controls applied (honest):
       - separate process (subprocess), NOT in the server process
-      - OS rlimits: CPU time, address space (memory), no core dump, file-size 0,
-        no child processes (RLIMIT_NPROC) -> can't fork a network helper
-      - network disabled in the child via env + no socket import allowed by screen
-      - hard wall-clock timeout (kills the tree)
+      - MANDATORY OS rlimits: CPU time, address space (memory), no core dump,
+        file-size 0, no child processes (RLIMIT_NPROC). FAIL CLOSED: if any one
+        cannot be applied, nothing runs (see _plan_mandatory_rlimits /
+        _apply_mandatory_rlimits) and the DENY shape comes back with
+        execution_attempted=False.
+      - socket monkeypatched in the child preamble + socket import banned by the
+        static screen (in-process, best effort; not a network namespace)
+      - hard wall-clock timeout
       - temp CWD, minimal env (no secrets), text-only capture
+    This is NOT an OS isolation boundary (no seccomp/namespaces/container here).
     Returns stdout/stderr/exit/timing. NEVER raises into the server.
     """
     if lang != "python":
         return {"ok": False, "error": "only python is sandboxed in this build",
                 "stdout": "", "stderr": "unsupported language: %s" % lang, "exit": -1,
                 "isolation": "n/a", "execution_attempted": False}
-    if os.name != "posix" or _resource is None:
-        return {
-            "ok": False,
-            "error": "sandbox unavailable: POSIX resource limits are required",
-            "stdout": "",
-            "stderr": "execution denied because rlimits cannot be enforced",
-            "exit": -1,
-            "isolation": "unavailable (fail closed: POSIX rlimits required)",
-            "execution_attempted": False,
-        }
+    res, plan, refusal = _plan_mandatory_rlimits(timeout_s, mem_mb)
+    if refusal == _NO_POSIX_LIMITS_ERROR:
+        return _sandbox_denied(refusal, "unavailable (fail closed: POSIX rlimits required)",
+                               stderr="execution denied because rlimits cannot be enforced")
+    if refusal:
+        return _sandbox_denied(refusal, "unavailable (fail closed: mandatory rlimits required)")
 
     def _limits():
-        # child-only resource limits (POSIX). Applied in the forked child pre-exec.
-        try:
-            _resource.setrlimit(_resource.RLIMIT_CPU, (timeout_s, timeout_s))
-            soft = mem_mb * 1024 * 1024
-            _resource.setrlimit(_resource.RLIMIT_AS, (soft, soft))
-            _resource.setrlimit(_resource.RLIMIT_CORE, (0, 0))
-            _resource.setrlimit(_resource.RLIMIT_FSIZE, (0, 0))   # no file writes
-            try:
-                _resource.setrlimit(_resource.RLIMIT_NPROC, (0, 0))  # no new processes
-            except Exception:
-                pass
-        except Exception:
-            pass
+        # child-only, MANDATORY resource limits; raises (never swallows) on failure.
+        _apply_mandatory_rlimits(res, plan)
 
     env = {"PATH": "/usr/bin:/bin", "PYTHONDONTWRITEBYTECODE": "1",
            "HOME": "/tmp", "no_proxy": "*", "PYTHONUNBUFFERED": "1"}
@@ -505,6 +603,13 @@ def _sandbox_exec(code: str, lang: str = "python", timeout_s: int = 6,
                     "exit": -9, "elapsed_ms": round((time.time() - t0) * 1000, 1),
                     "execution_attempted": True,
                     "isolation": "sandboxed (restricted subprocess) — timed out and killed"}
+        except subprocess.SubprocessError:
+            # CPython raises a bare SubprocessError when preexec_fn raised in the
+            # forked child; the child exits before exec, so the code never ran.
+            return _sandbox_denied(_LIMIT_HOOK_FAILED_ERROR,
+                                   "unavailable (fail closed: mandatory rlimit hook failed "
+                                   "before exec)",
+                                   elapsed_ms=round((time.time() - t0) * 1000, 1))
         except Exception as e:
             return {"ok": False, "stdout": "", "stderr": "sandbox error: %s" % e,
                     "exit": -1, "elapsed_ms": round((time.time() - t0) * 1000, 1),
@@ -1005,7 +1110,7 @@ def governed_turn(mode: str, prompt: str, sign_fn, ns: str,
             sandbox_refused = sandbox_result.get("execution_attempted") is False
             if sandbox_refused:
                 refusal_detail = (sandbox_result.get("error") or
-                                  "sandbox refused execution before a child process started")
+                                  "sandbox refused execution before the code ran")
                 # Replace rather than mutate: the earlier policy receipt already
                 # hashed the original reasons list.
                 reasons = reasons + ["sandbox execution refused: %s" % refusal_detail]
@@ -1097,7 +1202,7 @@ def governed_turn(mode: str, prompt: str, sign_fn, ns: str,
                 "receipt. This is the governance working." % why)
     if sandbox_refused:
         why = "; ".join(reasons)
-        summ = ("Blocked. The sandbox refused execution before a child process started because: %s. "
+        summ = ("Blocked. The sandbox refused execution because: %s. "
                 "No code ran and nothing was emitted; only a signed deny receipt was produced." % why)
 
     return {
