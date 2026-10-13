@@ -1,7 +1,20 @@
 # SPDX-License-Identifier: Apache-2.0
 """Cross-platform import and fail-closed sandbox tests."""
 
+import pytest
+
 from szl_substrate import a11oy_code_engine as code_engine
+
+
+@pytest.fixture(autouse=True)
+def offline(monkeypatch):
+    """These tests must never reach a model endpoint, even when a token is set."""
+    monkeypatch.setattr(code_engine, "_model_configured", lambda: False)
+
+    def _no_model(*_a, **_k):
+        raise AssertionError("model endpoint must not be called in tests")
+
+    monkeypatch.setattr(code_engine, "_hf_chat", _no_model)
 
 
 def test_code_engine_imports_cross_platform():
