@@ -64,15 +64,23 @@ which wave moved each one.
 
 ## Absorbed modules
 
-szl-substrate is the designated canonical absorber for three archived repos —
-the archived repos point here (repo-level metadata, set at archive time
-2026-08-29: "Canonical: szl-holdings/szl-substrate"):
+On 2026-08-29 three repos were archived with repo-level metadata naming
+szl-substrate as canonical. The September 2026 archive-portfolio v2 review
+([`.github/docs/ARCHIVE_PORTFOLIO_V2.md`](https://github.com/szl-holdings/.github/blob/main/docs/ARCHIVE_PORTFOLIO_V2.md))
+restored two of them as active, standalone source owners. Only one remains
+absorbed here:
 
-| Archived repo | What it owned | Pointer evidence |
+| Repo | What it owns | Status (GitHub metadata, re-checked 2026-10-13) |
 |---|---|---|
-| [`vsp-otel`](https://github.com/szl-holdings/vsp-otel) | Λ-signed OpenTelemetry exporter (Layer-4 Λ-gate exporter) for SZL audit fibers | Archived 2026-08-29; repo description names szl-substrate canonical |
-| [`szl-telemetry`](https://github.com/szl-holdings/szl-telemetry) | Daily public-API telemetry snapshots of the SZLHOLDINGS Hugging Face estate | Archived 2026-08-29; repo description names szl-substrate canonical |
-| [`szl-mesh`](https://github.com/szl-holdings/szl-mesh) | Doctrine-pinned mesh coordination — DSSE receipt chains over CRDT fleet state | Archived 2026-08-29; repo description names szl-substrate canonical |
+| [`szl-telemetry`](https://github.com/szl-holdings/szl-telemetry) | Daily public-API telemetry snapshots of the SZLHOLDINGS Hugging Face estate | **Archived** 2026-08-29; repo description names szl-substrate canonical |
+| [`vsp-otel`](https://github.com/szl-holdings/vsp-otel) | OTLP collector, signed-span exporter and Helm package | **Active, not archived.** Restored by archive-portfolio v2; its README declares itself the canonical OTel package. Not absorbed into szl-substrate |
+| [`szl-mesh`](https://github.com/szl-holdings/szl-mesh) | Disconnected-state CRDT convergence / UDS mesh coordination | **Active, not archived.** Restored by archive-portfolio v2; its README declares itself the active mesh repo. Not absorbed into szl-substrate |
+
+The 2026-08-29 absorption of `vsp-otel` and `szl-mesh` is historical: no
+planned extraction of either into this package has been cut over or
+deployed. References elsewhere in this package to `szl-mesh` (for example the
+`szl-mesh:v0.4.0` UDS bundle in `szl_uds_portability.py`) point at that
+standalone repo's artifacts.
 
 ## Install
 
