@@ -36,6 +36,12 @@ Build strategy (Series-A grade, honest):
     cannot finish synchronously in-image it runs on a receipted background tick
     (``refresh_tick`` / ``start_background_build``); status reports
     ``seed|building|full`` truthfully — never a fake "full".
+  * Every build writes a versioned staging generation. A single SQLite
+    transaction seals its digest/counts and swaps the active pointer; interrupted
+    builds remain invisible. Queries pin one active-generation read snapshot.
+  * The versioned M1 Brain decision ledger is searchable as metadata handles
+    (source URL + receipt + safety/quarantine) in a separate retrieval-only plane.
+    It grants exactly zero gradient/training authority.
 
 Graph model (our own original code; GraphRAG-shaped):
   nodes = {repo, file, symbol, hf_space, recipe}
@@ -80,6 +86,8 @@ import re
 import sqlite3
 import threading
 import time
+import uuid
+from pathlib import Path
 from typing import Any, Callable
 
 # Λ aggregator + receipts are reused from the shared brain / orchestrator.
@@ -92,9 +100,10 @@ ORG = os.environ.get("SZL_GITHUB_ORG", "szl-holdings")
 HF_ORG = os.environ.get("SZL_HF_ORG", "SZLHOLDINGS")
 RAG_DB_PATH = os.environ.get("A11OY_ORG_RAG_DB", "/app/data/a11oy_org_rag.db")
 GITHUB_API = "https://api.github.com"
-# Per the founder doctrine the platform injects the GitHub token at the network
-# layer; the env var below may also carry it on Hetzner / local runs.
-_GH_ENV_KEYS = ("CUSTOM_CRED_API_GITHUB_COM_TOKEN", "GITHUB_TOKEN", "GH_TOKEN")
+# Prefer the canonical runtime's optional public reader; retain local/CI aliases.
+# Credential presence is not an authorization or corpus-completeness claim.
+_GH_ENV_KEYS = ("A11OY_GITHUB_PUBLIC_READ_TOKEN", "CUSTOM_CRED_API_GITHUB_COM_TOKEN",
+                "GITHUB_TOKEN", "GH_TOKEN")
 # File extensions worth indexing as code/text (skip binaries).
 _TEXT_EXT = {".py", ".ts", ".tsx", ".js", ".jsx", ".lean", ".md", ".json", ".yaml",
              ".yml", ".toml", ".cfg", ".txt", ".html", ".css", ".sh", ".rs", ".go"}
@@ -225,6 +234,14 @@ def corpus_manifest() -> dict[str, Any]:
 
 
 _lock = threading.RLock()
+# Builders may run for minutes.  Queries must not take the builder lock; instead
+# they take this very short lock while pairing the immutable in-memory graph with
+# SQLite's active generation.  The SQLite read transaction then pins that
+# generation for the duration of the query.
+_SNAPSHOT_LOCK = threading.RLock()
+
+_M1_LEDGER_ENV = "A11OY_M1_BRAIN_LEDGER"
+_M1_LEDGER_DEFAULT = Path(__file__).resolve().parent / "model_release" / "m1" / "brain-ingest-ledger.jsonl"
 
 
 # --------------------------------------------------------------------------- #
@@ -279,6 +296,7 @@ class OrgGraph:
 
 # In-process graph cache (rebuilt by build_index).
 _GRAPH = OrgGraph()
+_REHYDRATE_ATTEMPTED = False
 _BUILD_META: dict[str, Any] = {"built": False, "ts": None, "repos": 0, "chunks": 0,
                                "honest_note": "index not built yet — call build_index"}
 
@@ -287,10 +305,48 @@ _BUILD_META: dict[str, Any] = {"built": False, "ts": None, "repos": 0, "chunks":
 # SQLite FTS5 + vector store
 # --------------------------------------------------------------------------- #
 def _db() -> sqlite3.Connection:
-    from pathlib import Path
     Path(RAG_DB_PATH).parent.mkdir(parents=True, exist_ok=True)
     conn = sqlite3.connect(RAG_DB_PATH, timeout=15)
+    try:
+        conn.row_factory = sqlite3.Row
+        conn.execute("PRAGMA busy_timeout=15000")
+        # WAL readers can create or modify -wal/-shm files even with mode=ro.
+        # Only a lifecycle/operator writer may migrate the journal. Rollback
+        # journaling keeps reads free of those writes; readers can delay a
+        # writer's commit within the same bounded SQLite busy timeout.
+        mode = conn.execute("PRAGMA journal_mode=DELETE").fetchone()[0]
+        if mode != "delete":
+            raise RuntimeError("Brain writer could not enable rollback journaling")
+        conn.execute("PRAGMA synchronous=FULL")
+        return conn
+    except BaseException:
+        conn.close()
+        raise
+
+
+class _ReadIndexUnavailable(RuntimeError):
+    storage_state = "LEGACY_WAL_REQUIRES_LIFECYCLE_WRITE"
+
+
+def _db_readonly() -> sqlite3.Connection:
+    """Read the published index without creating a database or changing schema."""
+    path = Path(RAG_DB_PATH).resolve()
+    if not path.is_file():
+        raise FileNotFoundError(str(path))
+    # Inspect without SQLite first: opening a legacy WAL index can create its
+    # sidecars before query_only is set. Never migrate or use immutable=1 on a
+    # mutable generation; an explicit writer must perform this conversion.
+    with path.open("rb") as source:
+        header = source.read(100)
+    if header[:16] == b"SQLite format 3\x00" and 2 in header[18:20]:
+        raise _ReadIndexUnavailable(
+            "legacy WAL Brain index requires an explicit lifecycle/operator "
+            "write before read-only retrieval"
+        )
+    conn = sqlite3.connect(path.as_uri() + "?mode=ro", uri=True, timeout=15)
     conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA busy_timeout=15000")
+    conn.execute("PRAGMA query_only=ON")
     return conn
 
 
@@ -322,8 +378,433 @@ def _init_schema(conn: sqlite3.Connection) -> bool:
         "CREATE TABLE IF NOT EXISTS org_vectors("
         "chunk_id TEXT PRIMARY KEY, dim INTEGER, vec TEXT)"
     )
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS org_runtime_meta("
+        "key TEXT PRIMARY KEY, value TEXT NOT NULL)"
+    )
+    # Generation tables are additive so old installations can be opened and
+    # rebuilt without destructive migration.  A generation is immutable once it
+    # becomes ACTIVE; only the singleton pointer changes during publication.
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS org_generations("
+        "generation_id TEXT PRIMARY KEY, status TEXT NOT NULL, mode TEXT NOT NULL, "
+        "created_at REAL NOT NULL, activated_at REAL, chunk_count INTEGER NOT NULL DEFAULT 0, "
+        "vector_count INTEGER NOT NULL DEFAULT 0, brain_handle_count INTEGER NOT NULL DEFAULT 0, "
+        "graph_json TEXT, meta_json TEXT, digest_sha256 TEXT, failure_reason TEXT)"
+    )
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS org_active_generation("
+        "singleton INTEGER PRIMARY KEY CHECK(singleton=1), generation_id TEXT NOT NULL)"
+    )
+    if has_fts5:
+        conn.execute(
+            "CREATE VIRTUAL TABLE IF NOT EXISTS org_chunks_gen USING fts5("
+            "generation_id UNINDEXED, chunk_id UNINDEXED, node_id UNINDEXED, "
+            "repo UNINDEXED, path UNINDEXED, kind UNINDEXED, corpus UNINDEXED, "
+            "source UNINDEXED, title, body, sha256 UNINDEXED)"
+        )
+        conn.execute(
+            "CREATE VIRTUAL TABLE IF NOT EXISTS org_brain_handles_gen USING fts5("
+            "generation_id UNINDEXED, handle_id UNINDEXED, node_id UNINDEXED, "
+            "source UNINDEXED, source_url UNINDEXED, receipt_id UNINDEXED, "
+            "safety_decision UNINDEXED, training_decision UNINDEXED, "
+            "source_training_eligible UNINDEXED, title, metadata_text)"
+        )
+    else:
+        conn.execute(
+            "CREATE TABLE IF NOT EXISTS org_chunks_gen("
+            "generation_id TEXT, chunk_id TEXT, node_id TEXT, repo TEXT, path TEXT, "
+            "kind TEXT, corpus TEXT, source TEXT, title TEXT, body TEXT, sha256 TEXT)"
+        )
+        conn.execute(
+            "CREATE TABLE IF NOT EXISTS org_brain_handles_gen("
+            "generation_id TEXT, handle_id TEXT, node_id TEXT, source TEXT, "
+            "source_url TEXT, receipt_id TEXT, safety_decision TEXT, "
+            "training_decision TEXT, source_training_eligible TEXT, title TEXT, "
+            "metadata_text TEXT)"
+        )
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS org_vectors_gen("
+        "generation_id TEXT NOT NULL, chunk_id TEXT NOT NULL, dim INTEGER, vec TEXT, "
+        "PRIMARY KEY(generation_id,chunk_id))"
+    )
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS org_recovery_operations("
+        "operation_id TEXT PRIMARY KEY, incident_id TEXT NOT NULL, status TEXT NOT NULL, "
+        "actor TEXT NOT NULL, tenant TEXT NOT NULL, auth_scope TEXT NOT NULL, "
+        "source_path TEXT NOT NULL, source_revision TEXT NOT NULL, source_digest TEXT NOT NULL, "
+        "indexed_sha256 TEXT, artifact_id TEXT NOT NULL, candidate_id TEXT, regression_id TEXT, "
+        "active_generation_id TEXT, attempt_count INTEGER NOT NULL DEFAULT 0, "
+        "max_attempts INTEGER NOT NULL, deadline_at REAL NOT NULL, lease_owner TEXT, "
+        "lease_until REAL, kill_switch INTEGER NOT NULL DEFAULT 0, "
+        "production_authority INTEGER NOT NULL DEFAULT 0, spec_json TEXT NOT NULL, "
+        "created_at REAL NOT NULL, updated_at REAL NOT NULL, result_json TEXT)"
+    )
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS org_recovery_transitions("
+        "transition_id TEXT PRIMARY KEY, operation_id TEXT NOT NULL, incident_id TEXT NOT NULL, "
+        "state TEXT NOT NULL, parent_transition_id TEXT, actor TEXT NOT NULL, tenant TEXT NOT NULL, "
+        "auth_scope TEXT NOT NULL, source_path TEXT NOT NULL, source_revision TEXT NOT NULL, "
+        "source_digest TEXT NOT NULL, artifact_id TEXT NOT NULL, candidate_id TEXT, "
+        "indexed_sha256 TEXT, preconditions_json TEXT NOT NULL, outcomes_json TEXT NOT NULL, "
+        "unresolved_json TEXT NOT NULL, evidence_ref TEXT NOT NULL, created_at REAL NOT NULL)"
+    )
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS org_source_revocations("
+        "revocation_id TEXT PRIMARY KEY, source_path TEXT NOT NULL, source_digest TEXT NOT NULL, "
+        "actor TEXT NOT NULL, tenant TEXT NOT NULL, created_at REAL NOT NULL, reason TEXT NOT NULL)"
+    )
     conn.commit()
     return has_fts5
+
+
+def _active_generation(conn: sqlite3.Connection) -> str | None:
+    row = conn.execute(
+        "SELECT generation_id FROM org_active_generation WHERE singleton=1"
+    ).fetchone()
+    return str(row["generation_id"]) if row else None
+
+
+def _begin_generation(conn: sqlite3.Connection, mode: str) -> str:
+    generation_id = f"{int(time.time() * 1_000_000)}-{uuid.uuid4().hex[:12]}"
+    conn.execute(
+        "INSERT INTO org_generations(generation_id,status,mode,created_at) VALUES(?,?,?,?)",
+        (generation_id, "BUILDING", mode, time.time()),
+    )
+    conn.commit()
+    return generation_id
+
+
+def _canonical_json(value: Any) -> str:
+    return json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+
+
+def _generation_digest(conn: sqlite3.Connection, generation_id: str,
+                       graph_data: dict[str, Any]) -> tuple[str, dict[str, int]]:
+    """Hash every persisted retrieval row plus the graph, in stable order."""
+    h = hashlib.sha256()
+    h.update(_canonical_json(graph_data).encode("utf-8"))
+    counts: dict[str, int] = {}
+    table_specs = (
+        ("chunks", "org_chunks_gen", ("chunk_id", "node_id", "repo", "path", "kind",
+                                       "corpus", "source", "title", "body", "sha256"),
+         "chunk_id"),
+        ("vectors", "org_vectors_gen", ("chunk_id", "dim", "vec"), "chunk_id"),
+        ("brain_handles", "org_brain_handles_gen",
+         ("handle_id", "node_id", "source", "source_url", "receipt_id",
+          "safety_decision", "training_decision", "source_training_eligible",
+          "title", "metadata_text"), "handle_id"),
+    )
+    for label, table, columns, order_col in table_specs:
+        n = 0
+        sql = (f"SELECT {','.join(columns)} FROM {table} WHERE generation_id=? "
+               f"ORDER BY {order_col}")
+        for row in conn.execute(sql, (generation_id,)):
+            h.update(label.encode("ascii"))
+            h.update(b"\0")
+            h.update(_canonical_json([row[c] for c in columns]).encode("utf-8"))
+            h.update(b"\n")
+            n += 1
+        counts[label] = n
+    return h.hexdigest(), counts
+
+
+def _resolve_m1_ledger() -> Path | None:
+    raw = os.environ.get(_M1_LEDGER_ENV, "").strip()
+    path = Path(raw).expanduser().resolve() if raw else _M1_LEDGER_DEFAULT
+    return path if path.is_file() else None
+
+
+def _verify_m1_ledger(path: Path) -> dict[str, Any]:
+    """Verify the release manifest when using the versioned in-repo M1 ledger."""
+    manifest_path = path.with_name("corpus-ingestion-manifest.json")
+    expected_sha = None
+    expected_rows = None
+    if manifest_path.is_file():
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        entry = ((manifest.get("ledgers") or {}).get("brain_nodes") or {})
+        expected_sha = entry.get("sha256")
+        expected_rows = entry.get("rows")
+    h = hashlib.sha256()
+    rows = 0
+    with path.open("rb") as stream:
+        for line in stream:
+            h.update(line)
+            if line.strip():
+                rows += 1
+    actual_sha = h.hexdigest()
+    if expected_sha and actual_sha != expected_sha:
+        raise ValueError("M1 Brain ledger SHA-256 does not match its release manifest")
+    if expected_rows is not None and rows != int(expected_rows):
+        raise ValueError("M1 Brain ledger row count does not match its release manifest")
+    return {"path": str(path), "sha256": actual_sha, "rows": rows,
+            "manifest_verified": bool(expected_sha and expected_rows is not None)}
+
+
+def _brain_handle_text(row: dict[str, Any]) -> tuple[str, str]:
+    """Return bounded metadata text only; never copy an external document body."""
+    canonical = str(row.get("canonical_text") or "")
+    title_match = re.search(r"(?m)^title:\s*(.+)$", canonical)
+    title = (title_match.group(1).strip() if title_match else
+             str(row.get("node_id") or "untitled Brain handle"))
+    prov = row.get("provenance") if isinstance(row.get("provenance"), dict) else {}
+    license_info = row.get("license") if isinstance(row.get("license"), dict) else {}
+    freshness = row.get("freshness") if isinstance(row.get("freshness"), dict) else {}
+    fields = {
+        "title": title,
+        "kind": row.get("kind"),
+        "source": prov.get("source"),
+        "url": prov.get("url"),
+        "evidence_label": prov.get("evidence_label"),
+        "receipt_id": row.get("receipt_id"),
+        "safety_decision": row.get("safety_decision"),
+        "training_decision": row.get("training_decision"),
+        "license_state": license_info.get("state"),
+        "freshness_state": freshness.get("state"),
+    }
+    return title, "\n".join(f"{k}: {v}" for k, v in fields.items() if v is not None)
+
+
+def _ingest_brain_handles(conn: sqlite3.Connection, generation_id: str,
+                          ledger_path: Path | None = None) -> dict[str, Any]:
+    """Index M1 rows as retrieval-only metadata handles with zero gradient authority."""
+    path = ledger_path or _resolve_m1_ledger()
+    if path is None:
+        return {"state": "ABSENT", "count": 0, "gradient_authority_rows": 0}
+    verified = _verify_m1_ledger(path)
+    count = 0
+    source_training_eligible_rows = 0
+    with path.open(encoding="utf-8") as stream:
+        for raw_line in stream:
+            if not raw_line.strip():
+                continue
+            row = json.loads(raw_line)
+            node_id = str(row.get("node_id") or "").strip()
+            receipt_id = str(row.get("receipt_id") or "").strip()
+            if not node_id or not receipt_id:
+                raise ValueError("M1 Brain handle is missing node_id or receipt_id")
+            prov = row.get("provenance") if isinstance(row.get("provenance"), dict) else {}
+            title, metadata_text = _brain_handle_text(row)
+            handle_id = hashlib.sha256(
+                f"{node_id}\0{receipt_id}".encode("utf-8")
+            ).hexdigest()
+            conn.execute(
+                "INSERT INTO org_brain_handles_gen("
+                "generation_id,handle_id,node_id,source,source_url,receipt_id,"
+                "safety_decision,training_decision,source_training_eligible,title,metadata_text) "
+                "VALUES(?,?,?,?,?,?,?,?,?,?,?)",
+                (generation_id, handle_id, node_id, str(prov.get("source") or ""),
+                 str(prov.get("url") or ""), receipt_id,
+                 str(row.get("safety_decision") or "UNKNOWN"),
+                 str(row.get("training_decision") or "UNKNOWN"),
+                 "true" if row.get("training_eligible") is True else "false",
+                 title, metadata_text),
+            )
+            if row.get("training_eligible") is True:
+                source_training_eligible_rows += 1
+            count += 1
+    conn.commit()
+    if count != int(verified["rows"]):
+        raise ValueError("M1 Brain handle ingest count changed during verified read")
+    return {"state": "INDEXED_RETRIEVAL_ONLY", "count": count,
+            "gradient_authority_rows": 0, "training_authority": "NONE",
+            "ledger_sha256": verified["sha256"],
+            "manifest_verified": verified["manifest_verified"],
+            "source_training_eligible_rows": source_training_eligible_rows}
+
+
+def _persist_runtime_state(conn: sqlite3.Connection, graph: OrgGraph,
+                           meta: dict[str, Any],
+                           generation_id: str | None = None) -> None:
+    """Seal one immutable generation and atomically make it query-active.
+
+    The optional legacy path is retained for focused callers that populated the
+    old tables directly: it copies their rows into a fresh generation before the
+    swap.  Production builders always pass their staging generation explicitly.
+    """
+    global _GRAPH, _BUILD_META
+    if generation_id is None:
+        generation_id = _begin_generation(conn, str(meta.get("mode") or "legacy-migration"))
+        conn.execute(
+            "INSERT INTO org_chunks_gen(generation_id,chunk_id,node_id,repo,path,kind,"
+            "corpus,source,title,body,sha256) SELECT ?,chunk_id,node_id,repo,path,kind,"
+            "corpus,source,title,body,sha256 FROM org_chunks", (generation_id,))
+        conn.execute(
+            "INSERT OR REPLACE INTO org_vectors_gen(generation_id,chunk_id,dim,vec) "
+            "SELECT ?,chunk_id,dim,vec FROM org_vectors", (generation_id,))
+        conn.commit()
+
+    if not meta.get("built"):
+        conn.execute(
+            "UPDATE org_generations SET status='FAILED',failure_reason=? "
+            "WHERE generation_id=? AND status='BUILDING'",
+            ("empty/unusable build refused before active-generation swap", generation_id),
+        )
+        conn.commit()
+        meta.update({"generation_id": generation_id,
+                     "integrity_state": "NOT_PUBLISHED_EMPTY_BUILD"})
+        return
+
+    graph_data = graph.to_dict()
+    with _SNAPSHOT_LOCK:
+        conn.commit()
+        conn.execute("BEGIN IMMEDIATE")
+        # Seal the exact rows protected by this writer transaction. No writer can
+        # change staging data between this digest and the active-pointer swap.
+        digest, counts = _generation_digest(conn, generation_id, graph_data)
+        revoked = _revoked_source_digests(conn)
+        if revoked:
+            placeholders = ",".join("?" for _ in revoked)
+            hit = conn.execute(
+                "SELECT sha256 FROM org_chunks_gen WHERE generation_id=? "
+                f"AND sha256 IN ({placeholders}) LIMIT 1",
+                (generation_id, *sorted(revoked)),
+            ).fetchone()
+            if hit is not None:
+                conn.execute(
+                    "UPDATE org_generations SET status='FAILED',failure_reason=? "
+                    "WHERE generation_id=? AND status='BUILDING'",
+                    ("revoked source digest refused before active-generation swap", generation_id),
+                )
+                conn.commit()
+                meta.update({
+                    "generation_id": generation_id,
+                    "integrity_state": "NOT_PUBLISHED_REVOKED_SOURCE",
+                    "production_authority": False,
+                })
+                return
+        meta.update({
+            "generation_id": generation_id,
+            "generation_digest_sha256": digest,
+            "integrity_state": "VERIFIED_AT_PUBLISH",
+            "corpus_chunk_count": counts["chunks"],
+            "brain_handle_count": counts["brain_handles"],
+            "training_authority_rows": 0,
+        })
+        meta_blob = _canonical_json(meta)
+        graph_blob = _canonical_json(graph_data)
+        previous = _active_generation(conn)
+        if previous and previous != generation_id:
+            conn.execute("UPDATE org_generations SET status='SUPERSEDED' WHERE generation_id=?",
+                         (previous,))
+        conn.execute(
+            "UPDATE org_generations SET status='ACTIVE',activated_at=?,chunk_count=?,"
+            "vector_count=?,brain_handle_count=?,graph_json=?,meta_json=?,digest_sha256=? "
+            "WHERE generation_id=? AND status='BUILDING'",
+            (time.time(), counts["chunks"], counts["vectors"], counts["brain_handles"],
+             graph_blob, meta_blob, digest, generation_id),
+        )
+        if conn.execute("SELECT changes() AS n").fetchone()["n"] != 1:
+            conn.rollback()
+            raise RuntimeError("generation publication refused: staging generation not BUILDING")
+        conn.execute(
+            "INSERT INTO org_active_generation(singleton,generation_id) VALUES(1,?) "
+            "ON CONFLICT(singleton) DO UPDATE SET generation_id=excluded.generation_id",
+            (generation_id,),
+        )
+        # Compatibility metadata is informational only. Rehydration trusts the
+        # active generation row and re-computes its digest, never these keys.
+        for key, value in {"build_meta": meta, "graph": graph_data}.items():
+            conn.execute(
+                "INSERT OR REPLACE INTO org_runtime_meta(key,value) VALUES(?,?)",
+                (key, _canonical_json(value)),
+            )
+        conn.commit()
+        _GRAPH = graph
+        _BUILD_META = dict(meta)
+
+
+def _rehydrate_runtime_state() -> bool:
+    """Restore only a digest-verified ACTIVE generation; mismatch fails closed."""
+    global _GRAPH, _BUILD_META, _REHYDRATE_ATTEMPTED
+    if _BUILD_META.get("built"):
+        return True
+    if _REHYDRATE_ATTEMPTED:
+        return False
+    _REHYDRATE_ATTEMPTED = True
+    try:
+        if not os.path.exists(RAG_DB_PATH):
+            return False
+        conn = _db_readonly()
+        conn.execute("BEGIN")
+        generation_id = _active_generation(conn)
+        if not generation_id:
+            conn.close()
+            _BUILD_META = {
+                "built": False, "ts": None, "repos": 0, "chunks": 0,
+                "rehydration_state": "REBUILD_REQUIRED_NO_GENERATION",
+                "honest_note": "legacy/unversioned Brain index is not trusted; rebuild required",
+            }
+            return False
+        row = conn.execute(
+            "SELECT * FROM org_generations WHERE generation_id=? AND status='ACTIVE'",
+            (generation_id,),
+        ).fetchone()
+        if not row or not row["graph_json"] or not row["meta_json"] or not row["digest_sha256"]:
+            conn.close()
+            raise ValueError("active Brain generation is incomplete")
+        graph_data = json.loads(row["graph_json"])
+        meta = json.loads(row["meta_json"])
+        actual_digest, counts = _generation_digest(conn, generation_id, graph_data)
+        conn.close()
+        count_match = (
+            counts["chunks"] == int(row["chunk_count"])
+            and counts["vectors"] == int(row["vector_count"])
+            and counts["brain_handles"] == int(row["brain_handle_count"])
+        )
+        if actual_digest != row["digest_sha256"] or not count_match:
+            _GRAPH = OrgGraph()
+            _BUILD_META = {
+                "built": False, "ts": None, "repos": 0, "chunks": 0,
+                "generation_id": generation_id,
+                "rehydration_state": "INTEGRITY_MISMATCH_REBUILD_REQUIRED",
+                "integrity_state": "FAILED_CLOSED",
+                "expected_generation_digest_sha256": row["digest_sha256"],
+                "actual_generation_digest_sha256": actual_digest,
+                "honest_note": "persisted Brain generation failed integrity validation; rebuild required",
+            }
+            return False
+        if not isinstance(meta, dict) or not meta.get("built"):
+            raise ValueError("active Brain generation metadata does not claim a built index")
+        graph = OrgGraph()
+        if isinstance(graph_data, dict):
+            for node in graph_data.get("nodes") or []:
+                if isinstance(node, dict) and isinstance(node.get("id"), str):
+                    attrs = {k: v for k, v in node.items() if k not in {"id", "kind"}}
+                    graph.add_node(node["id"], str(node.get("kind") or "unknown"), **attrs)
+            for edge in graph_data.get("edges") or []:
+                if isinstance(edge, dict):
+                    graph.add_edge(str(edge.get("src") or ""),
+                                   str(edge.get("dst") or ""),
+                                   str(edge.get("kind") or "related"))
+        _GRAPH = graph
+        _BUILD_META = dict(meta)
+        _BUILD_META["generation_id"] = generation_id
+        _BUILD_META["generation_digest_sha256"] = actual_digest
+        _BUILD_META["integrity_state"] = "VERIFIED_ON_REHYDRATE"
+        _BUILD_META["corpus_chunk_count"] = counts["chunks"]
+        _BUILD_META["brain_handle_count"] = counts["brain_handles"]
+        _BUILD_META["training_authority_rows"] = 0
+        _BUILD_META["rehydrated_from_sqlite"] = True
+        _BUILD_META["rehydrated_at"] = time.time()
+        return True
+    except _ReadIndexUnavailable as exc:
+        _BUILD_META = {
+            "built": False, "ts": None, "repos": 0, "chunks": 0,
+            "rehydration_state": "UNAVAILABLE",
+            "integrity_state": "UNAVAILABLE",
+            "storage_state": exc.storage_state,
+            "honest_error": str(exc),
+        }
+        return False
+    except Exception as exc:
+        _BUILD_META = {
+            "built": False, "ts": None, "repos": 0, "chunks": 0,
+            "rehydration_state": "FAILED",
+            "rehydration_error_type": type(exc).__name__,
+            "honest_note": "persisted Brain state could not be rehydrated; rebuild required",
+        }
+        return False
 
 
 # --------------------------------------------------------------------------- #
@@ -404,8 +885,7 @@ def build_index(repos: list[str] | None = None, max_files_per_repo: int = 120,
         graph = OrgGraph()
         conn = _db()
         has_fts5 = _init_schema(conn)
-        conn.execute("DELETE FROM org_chunks")
-        conn.execute("DELETE FROM org_vectors")
+        generation_id = _begin_generation(conn, "full-org")
 
         if repos is None:
             try:
@@ -464,46 +944,52 @@ def build_index(repos: list[str] | None = None, max_files_per_repo: int = 120,
                     cid = hashlib.sha256(f"{fid}:{j}".encode()).hexdigest()[:24]
                     csha = hashlib.sha256(seg.encode()).hexdigest()
                     conn.execute(
-                        "INSERT INTO org_chunks(chunk_id,node_id,repo,path,kind,corpus,source,title,body,sha256)"
-                        " VALUES(?,?,?,?,?,?,?,?,?,?)",
-                        (cid, fid, repo, path, "file", _cat, f"gh:{ORG}/{repo}", path, seg, csha))
+                        "INSERT INTO org_chunks_gen(generation_id,chunk_id,node_id,repo,path,kind,"
+                        "corpus,source,title,body,sha256) VALUES(?,?,?,?,?,?,?,?,?,?,?)",
+                        (generation_id, cid, fid, repo, path, "file", _cat,
+                         f"gh:{ORG}/{repo}", path, seg, csha))
                     if embed_fn is not None:
                         try:
                             v = embed_fn(seg)
                             conn.execute(
-                                "INSERT OR REPLACE INTO org_vectors(chunk_id,dim,vec) VALUES(?,?,?)",
-                                (cid, len(v), json.dumps([round(x, 6) for x in v])))
+                                "INSERT OR REPLACE INTO org_vectors_gen("
+                                "generation_id,chunk_id,dim,vec) VALUES(?,?,?,?)",
+                                (generation_id, cid, len(v),
+                                 json.dumps([round(x, 6) for x in v])))
                         except Exception:
                             pass
                     chunk_count += 1
             conn.commit()
 
-        global _GRAPH, _BUILD_META
-        _GRAPH = graph
-        _BUILD_META = {
-            "built": True, "mode": "full", "ts": time.time(), "org": ORG,
+        brain_handles = _ingest_brain_handles(conn, generation_id)
+        meta = {
+            "built": (chunk_count > 0 or brain_handles["count"] > 0),
+            "mode": "full", "ts": time.time(), "org": ORG,
             "repos": len(repos), "chunks": chunk_count,
             "fts5": has_fts5, "dense": embed_fn is not None,
             "node_count": len(graph.nodes), "edge_count": len(graph.edges),
             "build_ms": round((time.time() - t0) * 1000, 1),
             "corpus_categories": sorted({_category_for(r) for r in repos}),
+            "brain_handle_plane": brain_handles,
             "honest_note": ("dense vectors present" if embed_fn is not None
                             else "FTS5/lexical only — embedding model unavailable in this runtime (honest)"),
         }
+        _persist_runtime_state(conn, graph, meta, generation_id)
         conn.close()
-        rec = emit_receipt("org_rag.index.built", _BUILD_META) if emit_receipt else None
-        out = {"ok": True, **_BUILD_META}
+        rec = emit_receipt("org_rag.index.built", meta) if emit_receipt else None
+        out = {"ok": bool(meta.get("built")), **meta}
         if rec:
             out["khipu_hash"] = rec.get("hash")
         return out
 
 
-def _maybe_embedder() -> Callable[[str], list[float]] | None:
+def _maybe_embedder(load: bool = True) -> Callable[[str], list[float]] | None:
     """Return an embed(text)->vec callable using szl_rag's BAAI/bge model if it
     loads in this runtime; else None (honest degrade to FTS5-only)."""
     try:
         import szl_rag
-        szl_rag._ensure_loaded()
+        if load:
+            szl_rag._ensure_loaded()
         if not szl_rag._state.get("ready"):
             return None
         model = szl_rag._state["model"]
@@ -535,9 +1021,13 @@ def corpus_embedder() -> Callable[[str], list[float]] | None:
 def dense_vector_count() -> int:
     """COUNT(*) of dense vectors in org_vectors. Honest 0 on any error / no DB."""
     try:
-        conn = _db()
+        conn = _db_readonly()
         try:
-            row = conn.execute("SELECT COUNT(*) AS n FROM org_vectors").fetchone()
+            generation_id = _active_generation(conn)
+            row = (conn.execute(
+                "SELECT COUNT(*) AS n FROM org_vectors_gen WHERE generation_id=?",
+                (generation_id,)).fetchone() if generation_id else
+                conn.execute("SELECT COUNT(*) AS n FROM org_vectors").fetchone())
             return int(row["n"]) if row else 0
         finally:
             conn.close()
@@ -548,9 +1038,13 @@ def dense_vector_count() -> int:
 def chunk_count() -> int:
     """COUNT(*) of lexical chunks in org_chunks. Honest 0 on any error / no DB."""
     try:
-        conn = _db()
+        conn = _db_readonly()
         try:
-            row = conn.execute("SELECT COUNT(*) AS n FROM org_chunks").fetchone()
+            generation_id = _active_generation(conn)
+            row = (conn.execute(
+                "SELECT COUNT(*) AS n FROM org_chunks_gen WHERE generation_id=?",
+                (generation_id,)).fetchone() if generation_id else
+                conn.execute("SELECT COUNT(*) AS n FROM org_chunks").fetchone())
             return int(row["n"]) if row else 0
         finally:
             conn.close()
@@ -567,12 +1061,20 @@ def next_unembedded_chunks(limit: int = 4) -> list[dict[str, Any]]:
         return []
     out: list[dict[str, Any]] = []
     try:
-        conn = _db()
+        conn = _db_readonly()
         try:
-            rows = conn.execute(
-                "SELECT chunk_id,repo,path,corpus,source,body FROM org_chunks "
-                "WHERE chunk_id NOT IN (SELECT chunk_id FROM org_vectors) "
-                "LIMIT ?", (max(1, int(limit)),)).fetchall()
+            generation_id = _active_generation(conn)
+            if generation_id:
+                rows = conn.execute(
+                    "SELECT chunk_id,repo,path,corpus,source,body FROM org_chunks_gen "
+                    "WHERE generation_id=? AND chunk_id NOT IN (SELECT chunk_id FROM "
+                    "org_vectors_gen WHERE generation_id=?) LIMIT ?",
+                    (generation_id, generation_id, max(1, int(limit)))).fetchall()
+            else:
+                rows = conn.execute(
+                    "SELECT chunk_id,repo,path,corpus,source,body FROM org_chunks "
+                    "WHERE chunk_id NOT IN (SELECT chunk_id FROM org_vectors) LIMIT ?",
+                    (max(1, int(limit)),)).fetchall()
             for r in rows:
                 out.append({"chunk_id": r["chunk_id"], "repo": r["repo"],
                             "path": r["path"], "corpus": r["corpus"],
@@ -590,13 +1092,19 @@ def embed_and_store_chunk(chunk_id: str, vec: list[float]) -> dict[str, Any]:
     org_chunks — we never create a chunk row here, so an indexed chunk can never be
     fabricated. Returns {ok, chunk_id, dim} or an honest error. Uses the SAME
     storage format as _ingest_text (json list, 6-dp rounding)."""
+    global _BUILD_META
     if not chunk_id or not isinstance(vec, (list, tuple)) or len(vec) == 0:
         return {"ok": False, "honest_error": "empty chunk_id or vector — nothing stored"}
     try:
         conn = _db()
         try:
-            exists = conn.execute(
-                "SELECT 1 FROM org_chunks WHERE chunk_id=? LIMIT 1", (chunk_id,)).fetchone()
+            _init_schema(conn)
+            generation_id = _active_generation(conn)
+            exists = (conn.execute(
+                "SELECT 1 FROM org_chunks_gen WHERE generation_id=? AND chunk_id=? LIMIT 1",
+                (generation_id, chunk_id)).fetchone() if generation_id else
+                conn.execute("SELECT 1 FROM org_chunks WHERE chunk_id=? LIMIT 1",
+                             (chunk_id,)).fetchone())
             if not exists:
                 # Honest refusal: cannot add a vector for a chunk that was never
                 # really ingested (would imply a fabricated indexed chunk).
@@ -604,10 +1112,44 @@ def embed_and_store_chunk(chunk_id: str, vec: list[float]) -> dict[str, Any]:
                         "honest_error": "chunk_id not present in org_chunks — refusing "
                                         "to store a vector for a non-existent chunk "
                                         "(Zero-Bandaid Law: never fabricate an index)"}
-            conn.execute(
-                "INSERT OR REPLACE INTO org_vectors(chunk_id,dim,vec) VALUES(?,?,?)",
-                (chunk_id, len(vec), json.dumps([round(float(x), 6) for x in vec])))
-            conn.commit()
+            if generation_id:
+                # Vector useful-work is a bounded atomic augmentation: the vector,
+                # generation digest, count, and metadata change in one transaction.
+                # Readers see either the old snapshot or the fully sealed new one.
+                with _SNAPSHOT_LOCK:
+                    conn.commit()
+                    conn.execute("BEGIN IMMEDIATE")
+                    conn.execute(
+                        "INSERT OR REPLACE INTO org_vectors_gen("
+                        "generation_id,chunk_id,dim,vec) VALUES(?,?,?,?)",
+                        (generation_id, chunk_id, len(vec),
+                         json.dumps([round(float(x), 6) for x in vec])))
+                    generation = conn.execute(
+                        "SELECT graph_json,meta_json FROM org_generations "
+                        "WHERE generation_id=? AND status='ACTIVE'", (generation_id,)
+                    ).fetchone()
+                    if not generation:
+                        conn.rollback()
+                        raise RuntimeError("active generation disappeared during vector write")
+                    graph_data = json.loads(generation["graph_json"])
+                    meta = json.loads(generation["meta_json"])
+                    digest, counts = _generation_digest(conn, generation_id, graph_data)
+                    meta.update({
+                        "generation_digest_sha256": digest,
+                        "integrity_state": "VERIFIED_AFTER_ATOMIC_VECTOR_WRITE",
+                    })
+                    conn.execute(
+                        "UPDATE org_generations SET vector_count=?,digest_sha256=?,meta_json=? "
+                        "WHERE generation_id=? AND status='ACTIVE'",
+                        (counts["vectors"], digest, _canonical_json(meta), generation_id),
+                    )
+                    conn.commit()
+                    _BUILD_META = meta
+            else:
+                conn.execute(
+                    "INSERT OR REPLACE INTO org_vectors(chunk_id,dim,vec) VALUES(?,?,?)",
+                    (chunk_id, len(vec), json.dumps([round(float(x), 6) for x in vec])))
+                conn.commit()
         finally:
             conn.close()
     except Exception as exc:
@@ -796,7 +1338,8 @@ def _local_provenance(rel_from_corpus: str) -> dict[str, str]:
 
 def _ingest_local_category(graph: OrgGraph, conn: sqlite3.Connection, *, category: str,
                            local_dirs: list[str],
-                           embed_fn: Callable[[str], list[float]] | None
+                           embed_fn: Callable[[str], list[float]] | None,
+                           generation_id: str
                            ) -> tuple[int, int]:
     """Ingest the REAL in-image mirror files for one category.  Returns
     (files, chunks).  Each chunk is labeled with an honest 'bundled:<repo>@<sha>'
@@ -833,7 +1376,7 @@ def _ingest_local_category(graph: OrgGraph, conn: sqlite3.Connection, *, categor
             prov = _local_provenance(f"corpus/{rel}/{name}")
             wrote = _ingest_text(graph, conn, repo=prov["repo"], path=prov["path"],
                                  raw=raw, source=prov["source"], category=category,
-                                 embed_fn=embed_fn)
+                                 embed_fn=embed_fn, generation_id=generation_id)
             files_n += 1
             chunks_n += wrote
     return (files_n, chunks_n)
@@ -841,7 +1384,8 @@ def _ingest_local_category(graph: OrgGraph, conn: sqlite3.Connection, *, categor
 
 def _ingest_text(graph: OrgGraph, conn: sqlite3.Connection, *, repo: str, path: str,
                  raw: str, source: str, category: str,
-                 embed_fn: Callable[[str], list[float]] | None) -> int:
+                 embed_fn: Callable[[str], list[float]] | None,
+                 generation_id: str) -> int:
     """Shared ingest: graph nodes/edges + symbols + imports + FTS5/vector chunks.
     Returns the number of chunks written. Used by seed AND full builds so the two
     paths are byte-for-byte consistent in how they ground + cite."""
@@ -861,15 +1405,16 @@ def _ingest_text(graph: OrgGraph, conn: sqlite3.Connection, *, repo: str, path: 
         cid = hashlib.sha256(f"{source}:{fid}:{j}".encode()).hexdigest()[:24]
         csha = hashlib.sha256(seg.encode()).hexdigest()
         conn.execute(
-            "INSERT INTO org_chunks(chunk_id,node_id,repo,path,kind,corpus,source,title,body,sha256)"
-            " VALUES(?,?,?,?,?,?,?,?,?,?)",
-            (cid, fid, repo, path, "file", category, source, path, seg, csha))
+            "INSERT INTO org_chunks_gen(generation_id,chunk_id,node_id,repo,path,kind,"
+            "corpus,source,title,body,sha256) VALUES(?,?,?,?,?,?,?,?,?,?,?)",
+            (generation_id, cid, fid, repo, path, "file", category, source, path, seg, csha))
         if embed_fn is not None:
             try:
                 v = embed_fn(seg)
                 conn.execute(
-                    "INSERT OR REPLACE INTO org_vectors(chunk_id,dim,vec) VALUES(?,?,?)",
-                    (cid, len(v), json.dumps([round(x, 6) for x in v])))
+                    "INSERT OR REPLACE INTO org_vectors_gen(generation_id,chunk_id,dim,vec) "
+                    "VALUES(?,?,?,?)",
+                    (generation_id, cid, len(v), json.dumps([round(x, 6) for x in v])))
             except Exception:
                 pass
         n += 1
@@ -888,8 +1433,7 @@ def build_seed_index(emit_receipt: Callable[[str, dict], dict] | None = None) ->
         graph = OrgGraph()
         conn = _db()
         has_fts5 = _init_schema(conn)
-        conn.execute("DELETE FROM org_chunks")
-        conn.execute("DELETE FROM org_vectors")
+        generation_id = _begin_generation(conn, "seed")
         embed_fn = _maybe_embedder()
         per_cat: dict[str, dict[str, int]] = {}
         chunk_count = 0
@@ -921,7 +1465,8 @@ def build_seed_index(emit_receipt: Callable[[str, dict], dict] | None = None) ->
                     continue
                 repo_for = src.split("/")[-1]
                 wrote = _ingest_text(graph, conn, repo=repo_for, path=path, raw=raw,
-                                     source=src, category=cat, embed_fn=embed_fn)
+                                     source=src, category=cat, embed_fn=embed_fn,
+                                     generation_id=generation_id)
                 c_files += 1
                 c_chunks += wrote
                 chunk_count += wrote
@@ -932,7 +1477,8 @@ def build_seed_index(emit_receipt: Callable[[str, dict], dict] | None = None) ->
             local_dirs = spec.get("local_paths", [])
             if c_files == 0 and local_dirs:
                 lf, lc = _ingest_local_category(graph, conn, category=cat,
-                                                local_dirs=local_dirs, embed_fn=embed_fn)
+                                                local_dirs=local_dirs, embed_fn=embed_fn,
+                                                generation_id=generation_id)
                 c_files += lf
                 c_chunks += lc
                 chunk_count += lc
@@ -940,15 +1486,20 @@ def build_seed_index(emit_receipt: Callable[[str, dict], dict] | None = None) ->
             per_cat[cat] = {"files": c_files, "chunks": c_chunks}
             conn.commit()
 
-        global _GRAPH, _BUILD_META
-        _GRAPH = graph
-        _BUILD_META = {
-            "built": chunk_count > 0, "mode": "seed", "ts": time.time(), "org": ORG,
-            "repos": len({s for s in per_cat}), "chunks": chunk_count, "files": files_ok,
+        brain_handles = _ingest_brain_handles(conn, generation_id)
+        meta = {
+            "built": (chunk_count > 0 or brain_handles["count"] > 0),
+            "mode": "seed", "ts": time.time(), "org": ORG,
+            "repos": conn.execute(
+                "SELECT COUNT(DISTINCT repo) AS n FROM org_chunks_gen WHERE generation_id=?",
+                (generation_id,),
+            ).fetchone()["n"],
+            "chunks": chunk_count, "files": files_ok,
             "fts5": has_fts5, "dense": embed_fn is not None,
             "node_count": len(graph.nodes), "edge_count": len(graph.edges),
             "build_ms": round((time.time() - t0) * 1000, 1),
             "per_category": per_cat,
+            "brain_handle_plane": brain_handles,
             "corpus_categories": [c for c, v in per_cat.items() if v["chunks"] > 0],
             "gh_credential": bool(gh), "hf_credential": bool(hf),
             "honest_note": (
@@ -961,10 +1512,11 @@ def build_seed_index(emit_receipt: Callable[[str, dict], dict] | None = None) ->
                    "szl-holdings repos read UNAUTHENTICATED (rate-limited but real); "
                    "HF Spaces also ingested (honest, not fabricated).")),
         }
+        _persist_runtime_state(conn, graph, meta, generation_id)
         conn.close()
-        rec = emit_receipt("org_rag.index.seed", _BUILD_META) if emit_receipt else None
-        out = {"ok": _BUILD_META["built"], **_BUILD_META}
-        if not _BUILD_META["built"]:
+        rec = emit_receipt("org_rag.index.seed", meta) if emit_receipt else None
+        out = {"ok": meta["built"], **meta}
+        if not meta["built"]:
             out["honest_error"] = ("seed index empty — no corpus file could be fetched "
                                    "(no GitHub/HF credential reachable). NOT claiming a "
                                    "built index (Zero-Bandaid Law).")
@@ -987,8 +1539,7 @@ def build_full_corpus(emit_receipt: Callable[[str, dict], dict] | None = None,
         graph = OrgGraph()
         conn = _db()
         has_fts5 = _init_schema(conn)
-        conn.execute("DELETE FROM org_chunks")
-        conn.execute("DELETE FROM org_vectors")
+        generation_id = _begin_generation(conn, "full")
         embed_fn = _maybe_embedder()
         per_cat: dict[str, dict[str, int]] = {}
         chunk_count = 0
@@ -1029,7 +1580,8 @@ def build_full_corpus(emit_receipt: Callable[[str, dict], dict] | None = None,
                             continue
                         wrote = _ingest_text(graph, conn, repo=repo, path=f["path"],
                                              raw=raw, source=f"gh:{ORG}/{repo}",
-                                             category=cat, embed_fn=embed_fn)
+                                             category=cat, embed_fn=embed_fn,
+                                             generation_id=generation_id)
                         c_files += 1
                         c_chunks += wrote
                         chunk_count += wrote
@@ -1043,7 +1595,8 @@ def build_full_corpus(emit_receipt: Callable[[str, dict], dict] | None = None,
                         continue
                     wrote = _ingest_text(graph, conn, repo=sp, path=path, raw=raw,
                                          source=f"hf:{HF_ORG}/{sp}", category=cat,
-                                         embed_fn=embed_fn)
+                                         embed_fn=embed_fn,
+                                         generation_id=generation_id)
                     c_files += 1
                     c_chunks += wrote
                     chunk_count += wrote
@@ -1056,7 +1609,8 @@ def build_full_corpus(emit_receipt: Callable[[str, dict], dict] | None = None,
             local_dirs = spec.get("local_paths", [])
             if c_files == 0 and local_dirs:
                 lf, lc = _ingest_local_category(graph, conn, category=cat,
-                                                local_dirs=local_dirs, embed_fn=embed_fn)
+                                                local_dirs=local_dirs, embed_fn=embed_fn,
+                                                generation_id=generation_id)
                 c_files += lf
                 c_chunks += lc
                 chunk_count += lc
@@ -1067,15 +1621,16 @@ def build_full_corpus(emit_receipt: Callable[[str, dict], dict] | None = None,
                     "category": cat, "files": c_files, "chunks": c_chunks})
 
         built_cats = [c for c, v in per_cat.items() if v["chunks"] > 0]
-        global _GRAPH, _BUILD_META
-        _GRAPH = graph
-        _BUILD_META = {
-            "built": chunk_count > 0, "mode": "full", "ts": time.time(), "org": ORG,
+        brain_handles = _ingest_brain_handles(conn, generation_id)
+        meta = {
+            "built": (chunk_count > 0 or brain_handles["count"] > 0),
+            "mode": "full", "ts": time.time(), "org": ORG,
             "repos": len(seen_repo), "chunks": chunk_count,
             "fts5": has_fts5, "dense": embed_fn is not None,
             "node_count": len(graph.nodes), "edge_count": len(graph.edges),
             "build_ms": round((time.time() - t0) * 1000, 1),
             "per_category": per_cat, "corpus_categories": built_cats,
+            "brain_handle_plane": brain_handles,
             "gh_credential": bool(gh),
             "corpus_mirror": bool(_corpus_root()),
             "honest_note": (
@@ -1091,9 +1646,10 @@ def build_full_corpus(emit_receipt: Callable[[str, dict], dict] | None = None,
                    "source='bundled:<repo>@<commit_sha>:<path>' — real files, honest "
                    "provenance, NOT fabricated." if _corpus_root() else "")),
         }
+        _persist_runtime_state(conn, graph, meta, generation_id)
         conn.close()
-        rec = emit_receipt("org_rag.index.full", _BUILD_META) if emit_receipt else None
-        out = {"ok": _BUILD_META["built"], **_BUILD_META}
+        rec = emit_receipt("org_rag.index.full", meta) if emit_receipt else None
+        out = {"ok": meta["built"], **meta}
         if rec:
             out["khipu_hash"] = rec.get("hash")
         return out
@@ -1101,8 +1657,60 @@ def build_full_corpus(emit_receipt: Callable[[str, dict], dict] | None = None,
 
 # Background build state (receipted refresh tick) ----------------------------- #
 _BUILD_STATE: dict[str, Any] = {"phase": "idle", "started": None, "finished": None,
-                                "last_full": None, "error": None}
+                                "last_seed": None, "last_full": None, "error": None}
 _build_thread: "threading.Thread | None" = None
+
+
+def start_seed_bootstrap(
+    emit_receipt: Callable[[str, dict], dict] | None = None,
+) -> dict[str, Any]:
+    """Start one receipted seed build at application boot, never from a GET.
+
+    A verified published generation is reused without a write.  The worker
+    owns any index and receipt mutation, and a second bootstrap is a no-op.
+    """
+    global _build_thread
+    current = status()
+    if current.get("built"):
+        return {"ok": True, "phase": "rehydrated", "wrote": False,
+                "generation_id": current.get("generation_id"),
+                "mode": current.get("mode")}
+    with _lock:
+        current = status()
+        if current.get("built"):
+            return {"ok": True, "phase": "rehydrated", "wrote": False,
+                    "generation_id": current.get("generation_id"),
+                    "mode": current.get("mode")}
+        if _build_thread is not None and _build_thread.is_alive():
+            return {"ok": True, "phase": _BUILD_STATE.get("phase") or "seeding",
+                    "wrote": False, "note": "Brain index build already in flight"}
+        _BUILD_STATE.update({"phase": "seeding", "started": time.time(),
+                             "finished": None, "error": None})
+
+        def _run_seed() -> None:
+            try:
+                result = build_seed_index(emit_receipt=emit_receipt)
+                finished = time.time()
+                _BUILD_STATE.update({
+                    "phase": "seed" if result.get("ok") else "error",
+                    "finished": finished,
+                    "last_seed": finished if result.get("ok") else None,
+                    "error": None if result.get("ok") else result.get("honest_error"),
+                    "khipu_hash": result.get("khipu_hash"),
+                    "generation_id": result.get("generation_id"),
+                })
+            except Exception as exc:  # pragma: no cover - lifecycle boundary
+                _BUILD_STATE.update({
+                    "phase": "error", "finished": time.time(),
+                    "error": f"{type(exc).__name__}: {str(exc)[:240]}",
+                })
+
+        _build_thread = threading.Thread(
+            target=_run_seed, name="a11oy-org-rag-seed", daemon=True
+        )
+        _build_thread.start()
+        return {"ok": True, "phase": "seeding", "wrote": False,
+                "note": "receipted seed initialization started by application lifecycle"}
 
 
 def start_background_build(emit_receipt: Callable[[str, dict], dict] | None = None,
@@ -1112,8 +1720,9 @@ def start_background_build(emit_receipt: Callable[[str, dict], dict] | None = No
     while building is a no-op that reports the in-flight phase."""
     global _build_thread
     with _lock:
-        if _BUILD_STATE["phase"] == "building" and _build_thread and _build_thread.is_alive():
-            return {"ok": True, "phase": "building", "note": "full build already in flight"}
+        if _build_thread and _build_thread.is_alive():
+            return {"ok": True, "phase": _BUILD_STATE.get("phase") or "building",
+                    "note": "index build already in flight"}
         # Always lay down a fresh labeled seed synchronously first.
         seed = build_seed_index(emit_receipt=emit_receipt) if seed_first else {}
         _BUILD_STATE.update({"phase": "building", "started": time.time(),
@@ -1178,47 +1787,950 @@ def _lambda(axis: list[float]) -> float:
     return math.exp(sum(math.log(x) for x in clamped) / len(clamped))
 
 
+# Explicit model-free reference retrieval. A caller detects support through this
+# constant plus the ``lexical_only`` query parameter, never through version text.
+LEXICAL_REFERENCE_CONTRACT = "szl.a11oy.org_rag.lexical_reference/v1"
+_LEXICAL_EXCERPT_MAX_BYTES = 2048
+_LEXICAL_SUPPORT_STATEMENT = (
+    "Lexical scores rank token overlap between the question and indexed text. "
+    "They are not verified factual support, entailment, or calibrated correctness."
+)
+_BUNDLED_REVISION = re.compile(r"^bundled:[^@\s]+@([0-9a-f]{7,40}):")
+
+
+def _utf8_prefix_end(data: bytes, limit: int) -> int:
+    """Largest end <= limit that falls on a code-point boundary of valid UTF-8."""
+    end = min(len(data), limit)
+    while 0 < end < len(data) and (data[end] & 0xC0) == 0x80:
+        end -= 1
+    return end
+
+
+def _source_revision(source: object) -> tuple[str | None, str]:
+    match = _BUNDLED_REVISION.match(source) if isinstance(source, str) else None
+    if match is None:
+        return None, "NOT_RECORDED_IN_GENERATION"
+    revision = match.group(1)
+    return revision, "FULL_COMMIT" if len(revision) == 40 else "ABBREVIATED_COMMIT"
+
+
+def _lexical_reference_binding(body: object, stored_sha256: object) -> dict[str, Any] | None:
+    """Recompute the full-chunk digest and bind a bounded UTF-8 byte excerpt.
+
+    Returns ``None`` when the stored digest does not match the stored bytes. The
+    excerpt is a byte-exact prefix of the chunk and is never the digest preimage.
+    """
+    if not isinstance(body, str) or not isinstance(stored_sha256, str):
+        return None
+    try:
+        raw = body.encode("utf-8")
+    except UnicodeEncodeError:
+        return None
+    if not raw or hashlib.sha256(raw).hexdigest() != stored_sha256:
+        return None
+    end = _utf8_prefix_end(raw, _LEXICAL_EXCERPT_MAX_BYTES)
+    excerpt = raw[:end]
+    return {
+        "chunk_sha256": stored_sha256,
+        "chunk_utf8_bytes": len(raw),
+        "excerpt": excerpt.decode("utf-8"),
+        "excerpt_utf8_span": [0, end],
+        "excerpt_sha256": hashlib.sha256(excerpt).hexdigest(),
+        "excerpt_truncated": end < len(raw),
+    }
+
+
+def _lexical_unavailable(q: str, reason_code: str, integrity_state: str,
+                         honest_error: str, **extra: Any) -> dict[str, Any]:
+    return {"ok": False, "i_dont_know": True, "query": q, "chunks": [],
+            "lexical_contract": LEXICAL_REFERENCE_CONTRACT,
+            "retrieval_method": "lexical", "inference": "NOT_INVOKED",
+            "embedder_invoked": False, "router_dispatch_count": 0,
+            "receipt_emitted": False, "reason_code": reason_code,
+            "integrity_state": integrity_state, "honest_error": honest_error, **extra}
+
+
+_RECOVERY_FORWARD = (
+    "OBSERVED",
+    "TRIAGED",
+    "PROPOSED",
+    "ISOLATED",
+    "EVALUATED",
+    "APPROVAL_PENDING",
+    "APPLIED",
+    "VERIFIED",
+)
+_RECOVERY_TERMINAL = {"VERIFIED", "HELD", "CANCELLED", "RECOVERY_FAILED", "ROLLED_BACK"}
+_RECOVERY_ID = re.compile(r"^[a-z0-9][a-z0-9_.:-]{0,80}$")
+_SOURCE_HEX = set("0123456789abcdef")
+
+
+class RecoveryBoundaryInterrupt(RuntimeError):
+    """Stop after a committed recovery boundary.
+
+    The interrupt is ignored unless ``A11OY_RECOVERY_TEST_SEAM`` is ``1``.
+    It does not grant production authority.
+    """
+
+
+def retrieval_source_state(indexed_sha256: object, current_sha256: object) -> str:
+    """Compare one sealed chunk digest with one current source digest.
+
+    ``CURRENT`` means both values are lowercase SHA-256 hex and equal.
+    ``STALE`` means both are valid and different. Anything else is ``UNBOUND``.
+    A missing value is not a match. This does not publish an index.
+    """
+    def valid(value: object) -> bool:
+        return (
+            isinstance(value, str)
+            and len(value) == 64
+            and all(char in _SOURCE_HEX for char in value)
+        )
+    if not valid(indexed_sha256) or not valid(current_sha256):
+        return "UNBOUND"
+    if indexed_sha256 == current_sha256:
+        return "CURRENT"
+    return "STALE"
+
+
+def _revoked_source_digests(conn: sqlite3.Connection) -> set[str]:
+    try:
+        rows = conn.execute("SELECT source_digest FROM org_source_revocations").fetchall()
+    except sqlite3.Error:
+        return set()
+    return {str(row["source_digest"]) for row in rows if row["source_digest"]}
+
+
+def _witness_digest(value: object) -> object:
+    if not isinstance(value, str):
+        return None
+    if len(value) == 64 and all(char in _SOURCE_HEX for char in value):
+        return value
+    return hashlib.sha256(value.encode("utf-8")).hexdigest()
+
+
+def evaluate_recovery_candidate(*, candidate_body: str, holdout_body: str,
+                                required_tokens: tuple[str, ...]) -> dict[str, Any]:
+    """Apply fixed fixture criteria. This does not edit tests or promote an index."""
+    if (not required_tokens or not isinstance(candidate_body, str)
+            or not isinstance(holdout_body, str)):
+        return {"accepted": False, "reason": "UNBOUND", "production_authority": False,
+                "missing": [], "holdout_missing": []}
+    missing = [token for token in required_tokens if token not in candidate_body]
+    holdout_missing = [token for token in required_tokens if token not in holdout_body]
+    accepted = not missing and not holdout_missing
+    return {
+        "accepted": accepted,
+        "missing": missing,
+        "holdout_missing": holdout_missing,
+        "production_authority": False,
+        "reason": "FIXED_CRITERIA" if accepted else "CRITERIA_MISSED",
+    }
+
+
+def _recovery_unbound(reason: str) -> dict[str, Any]:
+    return {"ok": False, "status": "UNBOUND", "reason": reason,
+            "production_authority": False, "estate_operational": False}
+
+
+def _recovery_check_identity(operation_id: str, incident_id: str, actor: str,
+                             tenant: str, auth_scope: str, source_path: str,
+                             source_revision: str) -> str | None:
+    if not _RECOVERY_ID.fullmatch(operation_id or ""):
+        return "operation_id"
+    if not _RECOVERY_ID.fullmatch(incident_id or ""):
+        return "incident_id"
+    for label, value in (
+        ("actor", actor), ("tenant", tenant), ("auth_scope", auth_scope),
+        ("source_path", source_path), ("source_revision", source_revision),
+    ):
+        if not isinstance(value, str) or not value.strip() or len(value) > 512:
+            return label
+    return None
+
+
+def _recovery_transition(conn: sqlite3.Connection, *, operation_id: str, incident_id: str,
+                         state: str, parent: str | None, actor: str, tenant: str,
+                         auth_scope: str, source_path: str, source_revision: str,
+                         source_digest: str, artifact_id: str, candidate_id: str | None,
+                         indexed_sha256: str | None, preconditions: dict[str, Any],
+                         outcomes: dict[str, Any], unresolved: list[str],
+                         evidence_ref: str, now: float) -> str:
+    existing = None
+    if state not in {"REJECTED", "HELD"}:
+        existing = conn.execute(
+            "SELECT transition_id FROM org_recovery_transitions "
+            "WHERE operation_id=? AND state=? ORDER BY created_at LIMIT 1",
+            (operation_id, state),
+        ).fetchone()
+    if existing is not None:
+        return str(existing["transition_id"])
+    transition_id = f"{operation_id}:{state.lower()}:{uuid.uuid4().hex[:8]}"
+    conn.execute(
+        "INSERT INTO org_recovery_transitions("
+        "transition_id,operation_id,incident_id,state,parent_transition_id,actor,tenant,"
+        "auth_scope,source_path,source_revision,source_digest,artifact_id,candidate_id,"
+        "indexed_sha256,preconditions_json,outcomes_json,unresolved_json,evidence_ref,created_at) "
+        "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+        (transition_id, operation_id, incident_id, state, parent, actor, tenant, auth_scope,
+         source_path, source_revision, source_digest, artifact_id, candidate_id, indexed_sha256,
+         _canonical_json(preconditions), _canonical_json(outcomes), _canonical_json(unresolved),
+         evidence_ref, now),
+    )
+    conn.commit()
+    return transition_id
+
+
+def _recovery_rows(conn: sqlite3.Connection, operation_id: str) -> list[dict[str, Any]]:
+    rows = conn.execute(
+        "SELECT transition_id,state,parent_transition_id,actor,tenant,auth_scope,source_path,"
+        "source_revision,source_digest,artifact_id,candidate_id,indexed_sha256,preconditions_json,"
+        "outcomes_json,unresolved_json,evidence_ref,created_at "
+        "FROM org_recovery_transitions WHERE operation_id=? ORDER BY created_at,transition_id",
+        (operation_id,),
+    ).fetchall()
+    out = []
+    for row in rows:
+        item = {key: row[key] for key in row.keys()}
+        item["production_authority"] = False
+        out.append(item)
+    return out
+
+
+def _write_anatomy_records(path: str, records: list[dict[str, Any]]) -> None:
+    target = Path(path)
+    target.parent.mkdir(parents=True, exist_ok=True)
+    shown = []
+    for item in records[:32]:
+        shown.append({
+            "state": item.get("state"),
+            "operation_id": item.get("operation_id") or item.get("transition_id", "").split(":", 1)[0],
+            "source_path": item.get("source_path"),
+            "source_revision": item.get("source_revision"),
+            "source_digest": item.get("source_digest"),
+            "parent_transition_id": item.get("parent_transition_id"),
+            "evidence_ref": item.get("evidence_ref"),
+            "created_at": item.get("created_at"),
+            "production_authority": False,
+        })
+    payload = {"records": shown, "production_authority": False}
+    blob = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    temporary = target.with_suffix(target.suffix + ".tmp")
+    temporary.write_bytes(blob)
+    os.replace(temporary, target)
+
+
+def _recovery_finish(conn: sqlite3.Connection, operation_id: str, status: str,
+                     result: dict[str, Any], now: float,
+                     anatomy_path: str | None) -> dict[str, Any]:
+    records = _recovery_rows(conn, operation_id)
+    for record in records:
+        record["operation_id"] = operation_id
+    result = {
+        **result,
+        "ok": status == "VERIFIED",
+        "status": status,
+        "operation_id": operation_id,
+        "records": records,
+        "states": [record["state"] for record in records],
+        "production_authority": False,
+        "estate_operational": False,
+        "self_improvement": False,
+        "not_demonstrated": [
+            "general self-improvement",
+            "production authority",
+            "estate operational readiness",
+            "LIVE deployment",
+            "signer presence",
+            "clinical or biological effect",
+        ],
+    }
+    if anatomy_path:
+        _write_anatomy_records(anatomy_path, records)
+        result["anatomy_display"] = "WRITTEN"
+    else:
+        result["anatomy_display"] = "NOT_RUN"
+    conn.execute(
+        "UPDATE org_recovery_operations SET status=?,updated_at=?,result_json=?,lease_until=? "
+        "WHERE operation_id=?",
+        (status, now, _canonical_json(result), None, operation_id),
+    )
+    conn.commit()
+    return result
+
+
+def _stage_recovery_body(conn: sqlite3.Connection, *, mode: str, body: str,
+                         source_path: str) -> tuple[str, str]:
+    generation_id = _begin_generation(conn, mode)
+    graph = OrgGraph()
+    _ingest_text(
+        graph, conn, repo="fixture", path=source_path, raw=body, source="fixture:owned",
+        category="app_code", embed_fn=None, generation_id=generation_id,
+    )
+    conn.commit()
+    digest = hashlib.sha256(body.encode("utf-8")).hexdigest()
+    return generation_id, digest
+
+
+def _active_chunk(conn: sqlite3.Connection) -> sqlite3.Row | None:
+    active = _active_generation(conn)
+    if not active:
+        return None
+    return conn.execute(
+        "SELECT generation_id,body,sha256,path FROM org_chunks_gen WHERE generation_id=? LIMIT 1",
+        (active,),
+    ).fetchone()
+
+
+def run_stale_index_recovery(*, source_path: str, source_revision: str, original_body: str,
+                             changed_body: str, actor: str, tenant: str, auth_scope: str,
+                             operation_id: str, incident_id: str,
+                             required_tokens: tuple[str, ...] = ("owned-token",),
+                             holdout_body: str, regression_body: str,
+                             now: float | None = None, deadline_s: float = 30.0,
+                             max_attempts: int = 3, regression_repeats: int = 1,
+                             crash_after: str | None = None, kill_switch: bool = False,
+                             anatomy_path: str | None = None) -> dict[str, Any]:
+    """Run one synthetic stale-index recovery against the existing generation store.
+
+    The active generation stays the pinned original. A regression is rejected.
+    A valid candidate is isolated and is not given production authority.
+    Revocation of the candidate digest survives rollback. This fixture does not
+    establish self-improvement or estate readiness.
+    """
+    if os.environ.get("A11OY_RECOVERY_TEST_SEAM") != "1":
+        crash_after = None
+    problem = _recovery_check_identity(
+        operation_id, incident_id, actor, tenant, auth_scope, source_path, source_revision,
+    )
+    if problem:
+        return _recovery_unbound(problem)
+    if (not isinstance(original_body, str) or not isinstance(changed_body, str)
+            or not isinstance(holdout_body, str) or not isinstance(regression_body, str)):
+        return _recovery_unbound("body")
+    if max(len(original_body), len(changed_body), len(holdout_body), len(regression_body)) > 8000:
+        return _recovery_unbound("body_bound")
+    if not isinstance(required_tokens, tuple) or not 1 <= len(required_tokens) <= 8:
+        return _recovery_unbound("required_tokens")
+    clock = time.time() if now is None else float(now)
+    conn = _db()
+    try:
+        _init_schema(conn)
+        existing = conn.execute(
+            "SELECT status,result_json FROM org_recovery_operations WHERE operation_id=?",
+            (operation_id,),
+        ).fetchone()
+        if existing is not None and existing["status"] in _RECOVERY_TERMINAL and existing["result_json"]:
+            return json.loads(existing["result_json"])
+        if existing is not None:
+            return _recovery_unbound("operation_exists")
+        source_digest = hashlib.sha256(changed_body.encode("utf-8")).hexdigest()
+        spec = {
+            "original_body": original_body,
+            "changed_body": changed_body,
+            "holdout_body": holdout_body,
+            "regression_body": regression_body,
+            "required_tokens": list(required_tokens),
+            "regression_repeats": int(regression_repeats),
+            "query_text": required_tokens[0],
+        }
+        conn.execute(
+            "INSERT INTO org_recovery_operations("
+            "operation_id,incident_id,status,actor,tenant,auth_scope,source_path,source_revision,"
+            "source_digest,artifact_id,attempt_count,max_attempts,deadline_at,lease_owner,"
+            "lease_until,kill_switch,production_authority,spec_json,created_at,updated_at) "
+            "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            (operation_id, incident_id, "OPEN", actor, tenant, auth_scope, source_path,
+             source_revision, source_digest, "pending", 0, int(max_attempts),
+             clock + float(deadline_s), actor, clock + 30.0, 1 if kill_switch else 0, 0,
+             _canonical_json(spec), clock, clock),
+        )
+        conn.commit()
+        return _continue_stale_index_recovery(
+            conn, operation_id=operation_id, now=clock, crash_after=crash_after,
+            anatomy_path=anatomy_path, actor=actor,
+        )
+    finally:
+        conn.close()
+
+
+def resume_stale_index_recovery(operation_id: str, *, actor: str, tenant: str,
+                                now: float | None = None,
+                                anatomy_path: str | None = None) -> dict[str, Any]:
+    """Continue one committed recovery operation after a process boundary."""
+    if not _RECOVERY_ID.fullmatch(operation_id or ""):
+        return _recovery_unbound("operation_id")
+    if not isinstance(actor, str) or not actor.strip() or not isinstance(tenant, str):
+        return _recovery_unbound("actor")
+    clock = time.time() if now is None else float(now)
+    conn = _db()
+    try:
+        _init_schema(conn)
+        return _continue_stale_index_recovery(
+            conn, operation_id=operation_id, now=clock, crash_after=None,
+            anatomy_path=anatomy_path, actor=actor,
+        )
+    finally:
+        conn.close()
+
+
+def _continue_stale_index_recovery(conn: sqlite3.Connection, *, operation_id: str,
+                                   now: float, crash_after: str | None,
+                                   anatomy_path: str | None, actor: str) -> dict[str, Any]:
+    row = conn.execute(
+        "SELECT * FROM org_recovery_operations WHERE operation_id=?",
+        (operation_id,),
+    ).fetchone()
+    if row is None:
+        return _recovery_unbound("operation_missing")
+    if row["status"] in _RECOVERY_TERMINAL and row["result_json"]:
+        return json.loads(row["result_json"])
+    if row["lease_until"] is not None and float(row["lease_until"]) > now and row["lease_owner"] not in {None, actor}:
+        return {"ok": False, "status": "HELD", "reason": "lease",
+                "production_authority": False, "estate_operational": False}
+    if float(row["deadline_at"]) < now:
+        parent = _recovery_transition(
+            conn, operation_id=operation_id, incident_id=row["incident_id"], state="CANCELLED",
+            parent=None, actor=row["actor"], tenant=row["tenant"], auth_scope=row["auth_scope"],
+            source_path=row["source_path"], source_revision=row["source_revision"],
+            source_digest=row["source_digest"], artifact_id=row["artifact_id"] or "pending",
+            candidate_id=row["candidate_id"], indexed_sha256=row["indexed_sha256"],
+            preconditions={"deadline_at": row["deadline_at"]},
+            outcomes={"cancelled": True}, unresolved=["deadline passed"],
+            evidence_ref="recovery-deadline", now=now,
+        )
+        return _recovery_finish(
+            conn, operation_id, "CANCELLED",
+            {"reason": "deadline", "parent_transition_id": parent, "demonstrated": ["cancellation"]},
+            now, anatomy_path,
+        )
+    spec = json.loads(row["spec_json"])
+    required_tokens = tuple(spec["required_tokens"])
+    source_path = str(row["source_path"])
+    active = _active_chunk(conn)
+    if active is None:
+        active_id, _indexed = _stage_recovery_body(
+            conn, mode="recovery-active", body=spec["original_body"], source_path=source_path,
+        )
+        graph = OrgGraph()
+        graph.add_node("szl-holdings/fixture", "repo", repo="fixture")
+        _persist_runtime_state(
+            conn, graph,
+            {"built": True, "mode": "recovery-active", "ts": now, "repos": 1, "chunks": 1},
+            active_id,
+        )
+        active = _active_chunk(conn)
+        if active is None or str(active["generation_id"]) != active_id:
+            return _recovery_finish(
+                conn, operation_id, "RECOVERY_FAILED",
+                {"reason": "active generation was not pinned", "demonstrated": []},
+                now, anatomy_path,
+            )
+    pinned_id = str(active["generation_id"])
+    indexed_sha = str(active["sha256"])
+    current_sha = hashlib.sha256(spec["changed_body"].encode("utf-8")).hexdigest()
+    source_state = retrieval_source_state(indexed_sha, current_sha)
+    conn.execute(
+        "UPDATE org_recovery_operations SET active_generation_id=?,indexed_sha256=?,"
+        "artifact_id=?,lease_owner=?,lease_until=?,updated_at=? WHERE operation_id=?",
+        (pinned_id, indexed_sha, f"chunk:{indexed_sha}", actor, now + 30.0, now, operation_id),
+    )
+    conn.commit()
+    parent = None
+    observed_outcomes = {
+        "source_state": source_state,
+        "active_generation_id": pinned_id,
+        "indexed_body_sha256": indexed_sha,
+        "current_body_sha256": current_sha,
+    }
+    parent = _recovery_transition(
+        conn, operation_id=operation_id, incident_id=row["incident_id"], state="OBSERVED",
+        parent=parent, actor=row["actor"], tenant=row["tenant"], auth_scope=row["auth_scope"],
+        source_path=source_path, source_revision=row["source_revision"],
+        source_digest=current_sha, artifact_id=f"chunk:{indexed_sha}", candidate_id=None,
+        indexed_sha256=indexed_sha, preconditions={"active_generation_id": pinned_id},
+        outcomes=observed_outcomes, unresolved=[], evidence_ref="retrieval_source_state", now=now,
+    )
+    if source_state != "STALE":
+        return _recovery_finish(
+            conn, operation_id, "HELD",
+            {"reason": "source is not a stale valid digest", "demonstrated": ["source_state"]},
+            now, anatomy_path,
+        )
+    if int(row["kill_switch"]):
+        parent = _recovery_transition(
+            conn, operation_id=operation_id, incident_id=row["incident_id"], state="HELD",
+            parent=parent, actor=row["actor"], tenant=row["tenant"], auth_scope=row["auth_scope"],
+            source_path=source_path, source_revision=row["source_revision"],
+            source_digest=current_sha, artifact_id=f"chunk:{indexed_sha}", candidate_id=None,
+            indexed_sha256=indexed_sha, preconditions={"kill_switch": True},
+            outcomes={"held": True}, unresolved=["kill switch is set"],
+            evidence_ref="kill-switch", now=now,
+        )
+        return _recovery_finish(
+            conn, operation_id, "HELD",
+            {"reason": "kill switch", "demonstrated": ["kill_switch"]},
+            now, anatomy_path,
+        )
+    parent = _recovery_transition(
+        conn, operation_id=operation_id, incident_id=row["incident_id"], state="TRIAGED",
+        parent=parent, actor=row["actor"], tenant=row["tenant"], auth_scope=row["auth_scope"],
+        source_path=source_path, source_revision=row["source_revision"], source_digest=current_sha,
+        artifact_id=f"chunk:{indexed_sha}", candidate_id=None, indexed_sha256=indexed_sha,
+        preconditions={"max_attempts": int(row["max_attempts"]), "deadline_at": row["deadline_at"]},
+        outcomes={"bounded": True}, unresolved=[], evidence_ref="triage-bounds", now=now,
+    )
+    parent = _recovery_transition(
+        conn, operation_id=operation_id, incident_id=row["incident_id"], state="PROPOSED",
+        parent=parent, actor=row["actor"], tenant=row["tenant"], auth_scope=row["auth_scope"],
+        source_path=source_path, source_revision=row["source_revision"], source_digest=current_sha,
+        artifact_id=f"chunk:{indexed_sha}", candidate_id=None, indexed_sha256=indexed_sha,
+        preconditions={"production_authority": False},
+        outcomes={"proposal": "isolated rebuild", "production_authority": False},
+        unresolved=["no production promotion"], evidence_ref="proposal", now=now,
+    )
+    verdict = {"accepted": False, "reason": "UNBOUND", "production_authority": False}
+    if row["candidate_id"] is not None or row["status"] == "ISOLATED":
+        candidate_id = str(row["candidate_id"])
+        candidate_digest = current_sha
+        parent_row = conn.execute(
+            "SELECT transition_id FROM org_recovery_transitions "
+            "WHERE operation_id=? AND state='ISOLATED' LIMIT 1",
+            (operation_id,),
+        ).fetchone()
+        parent = str(parent_row["transition_id"]) if parent_row is not None else parent
+        verdict = evaluate_recovery_candidate(
+            candidate_body=spec["regression_body"], holdout_body=spec["holdout_body"],
+            required_tokens=required_tokens,
+        )
+    else:
+        repeats = max(1, int(spec.get("regression_repeats") or 1))
+        regression_id = row["regression_id"]
+        for _ in range(repeats):
+            if regression_id is None:
+                regression_id, _regression_digest = _stage_recovery_body(
+                    conn, mode="recovery-regression", body=spec["regression_body"],
+                    source_path=source_path,
+                )
+                conn.execute(
+                    "UPDATE org_generations SET status='REJECTED',failure_reason=? "
+                    "WHERE generation_id=? AND status='BUILDING'",
+                    ("fixed criteria missed; active generation unchanged", regression_id),
+                )
+            conn.execute(
+                "UPDATE org_recovery_operations SET regression_id=?,attempt_count=attempt_count+1,"
+                "updated_at=? WHERE operation_id=?",
+                (regression_id, now, operation_id),
+            )
+            conn.commit()
+            verdict = evaluate_recovery_candidate(
+                candidate_body=spec["regression_body"], holdout_body=spec["holdout_body"],
+                required_tokens=required_tokens,
+            )
+            parent = _recovery_transition(
+                conn, operation_id=operation_id, incident_id=row["incident_id"], state="REJECTED",
+                parent=parent, actor=row["actor"], tenant=row["tenant"], auth_scope=row["auth_scope"],
+                source_path=source_path, source_revision=row["source_revision"],
+                source_digest=current_sha, artifact_id=f"chunk:{indexed_sha}",
+                candidate_id=regression_id, indexed_sha256=indexed_sha,
+                preconditions={"active_generation_id": pinned_id},
+                outcomes=verdict, unresolved=["regression is not published"],
+                evidence_ref="evaluate_recovery_candidate", now=now,
+            )
+            attempt_count = int(conn.execute(
+                "SELECT attempt_count FROM org_recovery_operations WHERE operation_id=?",
+                (operation_id,),
+            ).fetchone()["attempt_count"])
+            if attempt_count >= int(row["max_attempts"]):
+                parent = _recovery_transition(
+                    conn, operation_id=operation_id, incident_id=row["incident_id"], state="HELD",
+                    parent=parent, actor=row["actor"], tenant=row["tenant"],
+                    auth_scope=row["auth_scope"], source_path=source_path,
+                    source_revision=row["source_revision"], source_digest=current_sha,
+                    artifact_id=f"chunk:{indexed_sha}", candidate_id=regression_id,
+                    indexed_sha256=indexed_sha, preconditions={"attempt_count": attempt_count},
+                    outcomes={"held": True}, unresolved=["equivalent failure limit"],
+                    evidence_ref="equivalent-failure-hold", now=now,
+                )
+                return _recovery_finish(
+                    conn, operation_id, "HELD",
+                    {"reason": "equivalent failures", "demonstrated": ["regression_rejected", "hold"]},
+                    now, anatomy_path,
+                )
+        candidate_id, candidate_digest = _stage_recovery_body(
+            conn, mode="recovery-isolated", body=spec["changed_body"], source_path=source_path,
+        )
+        conn.execute(
+            "UPDATE org_recovery_operations SET candidate_id=?,status='ISOLATED',updated_at=? "
+            "WHERE operation_id=?",
+            (candidate_id, now, operation_id),
+        )
+        conn.commit()
+        parent = _recovery_transition(
+        conn, operation_id=operation_id, incident_id=row["incident_id"], state="ISOLATED",
+        parent=parent, actor=row["actor"], tenant=row["tenant"], auth_scope=row["auth_scope"],
+        source_path=source_path, source_revision=row["source_revision"], source_digest=current_sha,
+        artifact_id=f"chunk:{indexed_sha}", candidate_id=candidate_id, indexed_sha256=indexed_sha,
+        preconditions={"active_generation_id": pinned_id},
+        outcomes={"candidate_status": "BUILDING", "production_authority": False},
+        unresolved=["candidate is not active"], evidence_ref="isolated-generation", now=now,
+    )
+    if crash_after == "isolated":
+        raise RecoveryBoundaryInterrupt("committed isolated generation; active generation unchanged")
+    valid = evaluate_recovery_candidate(
+        candidate_body=spec["changed_body"], holdout_body=spec["holdout_body"],
+        required_tokens=required_tokens,
+    )
+    parent = _recovery_transition(
+        conn, operation_id=operation_id, incident_id=row["incident_id"], state="EVALUATED",
+        parent=parent, actor=row["actor"], tenant=row["tenant"], auth_scope=row["auth_scope"],
+        source_path=source_path, source_revision=row["source_revision"], source_digest=current_sha,
+        artifact_id=f"chunk:{indexed_sha}", candidate_id=candidate_id, indexed_sha256=indexed_sha,
+        preconditions={"evaluator": "evaluate_recovery_candidate"},
+        outcomes=valid, unresolved=["approval does not promote the index"],
+        evidence_ref="evaluate_recovery_candidate", now=now,
+    )
+    if not valid["accepted"]:
+        return _recovery_finish(
+            conn, operation_id, "RECOVERY_FAILED",
+            {"reason": "valid candidate missed fixed criteria", "demonstrated": ["evaluation"]},
+            now, anatomy_path,
+        )
+    parent = _recovery_transition(
+        conn, operation_id=operation_id, incident_id=row["incident_id"], state="APPROVAL_PENDING",
+        parent=parent, actor=row["actor"], tenant=row["tenant"], auth_scope=row["auth_scope"],
+        source_path=source_path, source_revision=row["source_revision"], source_digest=current_sha,
+        artifact_id=f"chunk:{indexed_sha}", candidate_id=candidate_id, indexed_sha256=indexed_sha,
+        preconditions={"production_authority": False},
+        outcomes={"promotion": False}, unresolved=["no human production approval"],
+        evidence_ref="approval-pending", now=now,
+    )
+    conn.execute(
+        "INSERT INTO org_source_revocations("
+        "revocation_id,source_path,source_digest,actor,tenant,created_at,reason) "
+        "VALUES(?,?,?,?,?,?,?)",
+        (f"{operation_id}:revoke", source_path, candidate_digest, row["actor"], row["tenant"],
+         now, "candidate digest revoked before any promotion"),
+    )
+    conn.commit()
+    graph = OrgGraph()
+    publish_meta = {"built": True, "mode": "recovery-isolated", "ts": now, "repos": 1, "chunks": 1}
+    _persist_runtime_state(conn, graph, publish_meta, candidate_id)
+    if publish_meta.get("integrity_state") != "NOT_PUBLISHED_REVOKED_SOURCE":
+        return _recovery_finish(
+            conn, operation_id, "RECOVERY_FAILED",
+            {"reason": "revoked candidate was not refused", "demonstrated": ["revocation_check"]},
+            now, anatomy_path,
+        )
+    if _active_generation(conn) != pinned_id:
+        return _recovery_finish(
+            conn, operation_id, "RECOVERY_FAILED",
+            {"reason": "active generation changed", "demonstrated": []},
+            now, anatomy_path,
+        )
+    conn.execute(
+        "UPDATE org_generations SET status='ROLLED_BACK' WHERE generation_id=? AND status='FAILED'",
+        (candidate_id,),
+    )
+    conn.commit()
+    parent = _recovery_transition(
+        conn, operation_id=operation_id, incident_id=row["incident_id"], state="ROLLBACK_REQUIRED",
+        parent=parent, actor=row["actor"], tenant=row["tenant"], auth_scope=row["auth_scope"],
+        source_path=source_path, source_revision=row["source_revision"], source_digest=current_sha,
+        artifact_id=f"chunk:{indexed_sha}", candidate_id=candidate_id, indexed_sha256=indexed_sha,
+        preconditions={"integrity_state": "NOT_PUBLISHED_REVOKED_SOURCE"},
+        outcomes={"active_generation_id": pinned_id}, unresolved=[],
+        evidence_ref="publication-refusal", now=now,
+    )
+    parent = _recovery_transition(
+        conn, operation_id=operation_id, incident_id=row["incident_id"], state="ROLLED_BACK",
+        parent=parent, actor=row["actor"], tenant=row["tenant"], auth_scope=row["auth_scope"],
+        source_path=source_path, source_revision=row["source_revision"], source_digest=current_sha,
+        artifact_id=f"chunk:{indexed_sha}", candidate_id=candidate_id, indexed_sha256=indexed_sha,
+        preconditions={"rows_retained": True},
+        outcomes={"candidate_status": "ROLLED_BACK", "revocation_retained": True},
+        unresolved=[], evidence_ref="rollback", now=now,
+    )
+    served_body = conn.execute(
+        "SELECT body FROM org_chunks_gen WHERE generation_id=?",
+        (pinned_id,),
+    ).fetchone()
+    parent = _recovery_transition(
+        conn, operation_id=operation_id, incident_id=row["incident_id"], state="APPLIED",
+        parent=parent, actor=row["actor"], tenant=row["tenant"], auth_scope=row["auth_scope"],
+        source_path=source_path, source_revision=row["source_revision"], source_digest=current_sha,
+        artifact_id=f"chunk:{indexed_sha}", candidate_id=candidate_id, indexed_sha256=indexed_sha,
+        preconditions={"decision": "do_not_promote"},
+        outcomes={"active_body_sha256": indexed_sha, "production_authority": False},
+        unresolved=[], evidence_ref="decision-stored", now=now,
+    )
+    still_revoked = conn.execute(
+        "SELECT revocation_id FROM org_source_revocations WHERE source_digest=?",
+        (candidate_digest,),
+    ).fetchone()
+    parent = _recovery_transition(
+        conn, operation_id=operation_id, incident_id=row["incident_id"], state="VERIFIED",
+        parent=parent, actor=row["actor"], tenant=row["tenant"], auth_scope=row["auth_scope"],
+        source_path=source_path, source_revision=row["source_revision"], source_digest=current_sha,
+        artifact_id=f"chunk:{indexed_sha}", candidate_id=candidate_id, indexed_sha256=indexed_sha,
+        preconditions={"active_generation_id": pinned_id},
+        outcomes={
+            "active_unchanged": _active_generation(conn) == pinned_id,
+            "served_original": bool(served_body and served_body["body"] == spec["original_body"]),
+            "revocation_present": still_revoked is not None,
+            "production_authority": False,
+        },
+        unresolved=["fixture is not general recovery"],
+        evidence_ref="re-read", now=now,
+    )
+    return _recovery_finish(
+        conn, operation_id, "VERIFIED",
+        {
+            "reason": "refusal re-read; active index unchanged",
+            "parent_transition_id": parent,
+            "active_generation_id": pinned_id,
+            "candidate_id": candidate_id,
+            "regression_verdict": verdict,
+            "candidate_verdict": valid,
+            "demonstrated": [
+                "stale_source",
+                "regression_rejected",
+                "isolated_candidate",
+                "revocation",
+                "rollback",
+                "active_index_unchanged",
+            ] + (["restart_reconciliation"] if row["status"] == "ISOLATED" else []),
+        },
+        now, anatomy_path,
+    )
+
+
+def recovery_anatomy_view(conn: sqlite3.Connection, operation_id: str) -> dict[str, Any]:
+    """Return stored recovery rows for an Anatomy display. This does not stamp LIVE."""
+    _init_schema(conn)
+    records = _recovery_rows(conn, operation_id)
+    return {
+        "state": "DISPLAYED" if records else "NOT_RUN",
+        "records": records,
+        "production_authority": False,
+        "estate_operational": False,
+    }
+
+
 def query(q: str, k: int = 6, repo: str | None = None,
           hyde_text: str | None = None,
-          emit_receipt: Callable[[str, dict], dict] | None = None) -> dict[str, Any]:
+          emit_receipt: Callable[[str, dict], dict] | None = None,
+          load_embedder: bool = False,
+          source_witness: dict[str, str] | None = None,
+          lexical_only: bool = False) -> dict[str, Any]:
     """Two-stage Λ-weighted agentic-RAG query.
 
     Returns grounded chunks (above the Λ relevance floor) each with M2M
     ``file{path,sha256}`` evidence, plus an ``i_dont_know`` flag when support is
     too low.  ``hyde_text`` (optional) is a hypothetical answer used for dense
-    recall (HyDE) instead of the bare query."""
+    recall (HyDE) instead of the bare query.  By default this uses only the
+    published index and an already loaded embedder, with no model load or write.
+    An explicit command path may opt into model loading and receipt emission.
+
+    ``lexical_only=True`` selects the model-free reference mode. It never looks
+    up an embedder (even one already loaded), refuses HyDE, model loading and
+    receipts, searches only corpus chunks of the active generation, and binds the
+    sealed generation digest plus every recalled chunk's recomputed full-content
+    SHA-256. Any mismatch or unreadable suppression state fails closed.
+    """
+    if lexical_only is not False:
+        if lexical_only is not True:
+            return _lexical_unavailable(q, "LEXICAL_ONLY_FLAG_INVALID", "REFUSED",
+                                        "lexical_only must be exactly True or False")
+        if hyde_text is not None or emit_receipt is not None or load_embedder is not False:
+            return _lexical_unavailable(
+                q, "LEXICAL_ONLY_ARGUMENT_CONFLICT", "REFUSED",
+                "lexical-only retrieval refuses HyDE, model loading and receipts")
+    _rehydrate_runtime_state()
     if not _BUILD_META.get("built"):
-        return {"ok": False, "i_dont_know": True,
-                "honest_error": "org index not built — call /api/a11oy/code/rag/index first",
-                "query": q, "chunks": []}
-    conn = _db()
-    embed_fn = _maybe_embedder()
+        unbuilt = {"ok": False, "i_dont_know": True,
+                   "honest_error": _BUILD_META.get("honest_error") or
+                   "org index not built — call /api/a11oy/code/rag/index first",
+                   "integrity_state": _BUILD_META.get("integrity_state", "UNAVAILABLE"),
+                   "storage_state": _BUILD_META.get("storage_state"),
+                   "query": q, "chunks": []}
+        if lexical_only:
+            unbuilt = _lexical_unavailable(
+                q, "LEXICAL_REFERENCE_INDEX_UNAVAILABLE", unbuilt["integrity_state"],
+                unbuilt["honest_error"], storage_state=unbuilt["storage_state"])
+        return unbuilt
+    generation_row = None
+    with _SNAPSHOT_LOCK:
+        conn = None
+        try:
+            conn = _db_readonly()
+            conn.execute("BEGIN")
+            generation_id = _active_generation(conn)
+            if lexical_only and generation_id:
+                generation_row = conn.execute(
+                    "SELECT status,digest_sha256 FROM org_generations WHERE generation_id=?",
+                    (generation_id,),
+                ).fetchone()
+            graph_snapshot = _GRAPH
+            meta_snapshot = dict(_BUILD_META)
+        except Exception as exc:
+            if conn is not None:
+                conn.close()
+            if isinstance(exc, _ReadIndexUnavailable):
+                if lexical_only:
+                    return _lexical_unavailable(
+                        q, "LEXICAL_REFERENCE_INDEX_UNAVAILABLE", "UNAVAILABLE", str(exc),
+                        storage_state=exc.storage_state)
+                return {"ok": False, "i_dont_know": True, "query": q,
+                        "chunks": [], "integrity_state": "UNAVAILABLE",
+                        "storage_state": exc.storage_state,
+                        "honest_error": str(exc)}
+            failed = ("published Brain index unavailable for read: "
+                      f"{type(exc).__name__}")
+            if lexical_only:
+                return _lexical_unavailable(
+                    q, "LEXICAL_REFERENCE_INDEX_UNAVAILABLE", "FAILED_CLOSED", failed)
+            return {"ok": False, "i_dont_know": True, "query": q,
+                    "chunks": [], "integrity_state": "FAILED_CLOSED",
+                    "honest_error": failed}
+    if generation_id and generation_id != meta_snapshot.get("generation_id"):
+        conn.close()
+        mismatch = "Brain generation/graph snapshot mismatch; retry after rebuild"
+        if lexical_only:
+            return _lexical_unavailable(
+                q, "LEXICAL_REFERENCE_GENERATION_CHANGED", "FAILED_CLOSED", mismatch)
+        return {"ok": False, "i_dont_know": True, "query": q, "chunks": [],
+                "honest_error": mismatch,
+                "integrity_state": "FAILED_CLOSED"}
+    if lexical_only:
+        sealed_digest = meta_snapshot.get("generation_digest_sha256")
+        if not generation_id:
+            conn.close()
+            return _lexical_unavailable(
+                q, "LEXICAL_REFERENCE_REQUIRES_ACTIVE_GENERATION", "UNAVAILABLE",
+                "an unversioned index has no generation identity to bind")
+        if (generation_row is None or generation_row["status"] != "ACTIVE"
+                or not isinstance(sealed_digest, str) or not sealed_digest
+                or generation_row["digest_sha256"] != sealed_digest):
+            conn.close()
+            return _lexical_unavailable(
+                q, "LEXICAL_REFERENCE_GENERATION_DIGEST_MISMATCH", "FAILED_CLOSED",
+                "active generation row does not match the verified generation digest",
+                generation_id=generation_id)
+    # The lexical reference mode never reaches the embedder lookup.
+    embed_fn = None if lexical_only else _maybe_embedder(load=load_embedder)
     recall_text = hyde_text or q
+    lexical_backend = "fts5"
     # Stage 1: lexical recall (FTS5 or LIKE fallback).
-    rows: list[sqlite3.Row] = []
+    rows: list[dict[str, Any]] = []
     try:
-        sql = "SELECT chunk_id,node_id,repo,path,corpus,source,title,body,sha256 FROM org_chunks WHERE org_chunks MATCH ?"
-        args: list[Any] = [_fts_escape(q)]
+        if generation_id:
+            sql = ("SELECT chunk_id,node_id,repo,path,corpus,source,title,body,sha256 "
+                   "FROM org_chunks_gen WHERE org_chunks_gen MATCH ? AND generation_id=?")
+            args: list[Any] = [_fts_escape(q), generation_id]
+        else:
+            sql = ("SELECT chunk_id,node_id,repo,path,corpus,source,title,body,sha256 "
+                   "FROM org_chunks WHERE org_chunks MATCH ?")
+            args = [_fts_escape(q)]
         if repo:
             sql += " AND repo = ?"
             args.append(repo)
         sql += " LIMIT ?"
         args.append(max(k * 4, 24))
-        rows = list(conn.execute(sql, args))
+        rows = [{**dict(row), "retrieval_plane": "corpus"}
+                for row in conn.execute(sql, args)]
     except Exception:
         # LIKE fallback (non-FTS5 runtime) — labeled weaker.
+        lexical_backend = "like_fallback"
         like = f"%{re.sub(r'[^A-Za-z0-9_ ]', ' ', q)[:60]}%"
-        sql = "SELECT chunk_id,node_id,repo,path,corpus,source,title,body,sha256 FROM org_chunks WHERE body LIKE ?"
-        args = [like]
+        if generation_id:
+            sql = ("SELECT chunk_id,node_id,repo,path,corpus,source,title,body,sha256 "
+                   "FROM org_chunks_gen WHERE generation_id=? AND body LIKE ?")
+            args = [generation_id, like]
+        else:
+            sql = ("SELECT chunk_id,node_id,repo,path,corpus,source,title,body,sha256 "
+                   "FROM org_chunks WHERE body LIKE ?")
+            args = [like]
         if repo:
             sql += " AND repo = ?"
             args.append(repo)
         sql += " LIMIT ?"
         args.append(max(k * 4, 24))
         try:
-            rows = list(conn.execute(sql, args))
+            rows = [{**dict(row), "retrieval_plane": "corpus"}
+                    for row in conn.execute(sql, args)]
         except Exception:
             rows = []
+
+    # Search the M1 decision ledger as a distinct retrieval-only plane.  These
+    # rows are metadata handles (title/kind/source/URL/receipt/safety), not copied
+    # external documents, and never grant gradient or training authority.
+    # Handles have no full-content digest, so the lexical reference excludes them.
+    if generation_id and not lexical_only and (repo is None or repo == "m1-brain-ledger"):
+        handle_rows: list[sqlite3.Row] = []
+        try:
+            handle_rows = list(conn.execute(
+                "SELECT handle_id,node_id,source,source_url,receipt_id,safety_decision,"
+                "training_decision,source_training_eligible,title,metadata_text "
+                "FROM org_brain_handles_gen WHERE org_brain_handles_gen MATCH ? "
+                "AND generation_id=? LIMIT ?",
+                (_fts_escape(q), generation_id, max(k * 4, 24))))
+        except Exception:
+            like = f"%{re.sub(r'[^A-Za-z0-9_ ]', ' ', q)[:60]}%"
+            try:
+                handle_rows = list(conn.execute(
+                    "SELECT handle_id,node_id,source,source_url,receipt_id,safety_decision,"
+                    "training_decision,source_training_eligible,title,metadata_text "
+                    "FROM org_brain_handles_gen WHERE generation_id=? AND metadata_text LIKE ? "
+                    "LIMIT ?", (generation_id, like, max(k * 4, 24))))
+            except Exception:
+                handle_rows = []
+        for handle_row in handle_rows:
+            item = dict(handle_row)
+            rows.append({
+                "chunk_id": item["handle_id"], "node_id": item["node_id"],
+                "repo": "m1-brain-ledger", "path": f"brain-handle/{item['node_id']}",
+                "corpus": "brain_handles", "source": item["source"],
+                "title": item["title"], "body": item["metadata_text"],
+                "sha256": item["handle_id"], "retrieval_plane": "brain_handle",
+                "source_url": item["source_url"], "receipt_id": item["receipt_id"],
+                "safety_decision": item["safety_decision"],
+                "training_decision": item["training_decision"],
+                "source_training_eligible": item["source_training_eligible"],
+            })
+
+    revoked_suppressed = 0
+    if lexical_only:
+        # An unreadable suppression table is not an empty one in this mode.
+        try:
+            revoked = {str(row["source_digest"]) for row in conn.execute(
+                "SELECT source_digest FROM org_source_revocations").fetchall()
+                if row["source_digest"]}
+        except sqlite3.Error:
+            conn.close()
+            return _lexical_unavailable(
+                q, "LEXICAL_REFERENCE_SUPPRESSION_STATE_UNAVAILABLE", "FAILED_CLOSED",
+                "digest suppression state could not be read", generation_id=generation_id)
+    else:
+        revoked = _revoked_source_digests(conn)
+    if revoked:
+        kept_rows = []
+        for row in rows:
+            if str(row.get("sha256") or "") in revoked:
+                revoked_suppressed += 1
+                continue
+            kept_rows.append(row)
+        rows = kept_rows
+    if lexical_only:
+        for row in rows:
+            binding = _lexical_reference_binding(row.get("body"), row.get("sha256"))
+            if binding is None:
+                conn.close()
+                return _lexical_unavailable(
+                    q, "LEXICAL_REFERENCE_CHUNK_DIGEST_MISMATCH", "FAILED_CLOSED",
+                    "a recalled chunk does not match its sealed content digest",
+                    generation_id=generation_id, chunk_id=row.get("chunk_id"))
+            row["_reference"] = binding
 
     # dense vector for query (HyDE-aware)
     qvec = None
@@ -1237,14 +2749,18 @@ def query(q: str, k: int = 6, repo: str | None = None,
         lexical = (len(qtokens & btokens) / (len(qtokens) + 1e-9)) if qtokens else 0.0
         lexical = min(1.0, lexical)
         semantic = lexical
-        if qvec is not None:
-            row = conn.execute("SELECT vec FROM org_vectors WHERE chunk_id=?", (r["chunk_id"],)).fetchone()
+        if qvec is not None and r["retrieval_plane"] == "corpus":
+            row = (conn.execute(
+                "SELECT vec FROM org_vectors_gen WHERE generation_id=? AND chunk_id=?",
+                (generation_id, r["chunk_id"])).fetchone() if generation_id else
+                conn.execute("SELECT vec FROM org_vectors WHERE chunk_id=?",
+                             (r["chunk_id"],)).fetchone())
             if row:
                 try:
                     semantic = max(0.0, _cosine(qvec, json.loads(row["vec"])))
                 except Exception:
                     pass
-        centrality = _GRAPH.centrality(r["node_id"])
+        centrality = graph_snapshot.centrality(r["node_id"])
         # conformal anti-overconfidence floor 1/(n+1) over the recall set.
         conformal = 1.0 - 1.0 / (len(rows) + 1)
         # Λ over the three relevance axes (geometric mean — never 1.0 unless all 1.0).
@@ -1252,23 +2768,73 @@ def query(q: str, k: int = 6, repo: str | None = None,
         _cols = r.keys()
         corpus = (r["corpus"] if "corpus" in _cols else None) or _category_for(r["repo"])
         source = (r["source"] if "source" in _cols else None) or f"gh:{ORG}/{r['repo']}"
-        scored.append({
+        scored_item = {
             "chunk_id": r["chunk_id"], "node_id": r["node_id"], "repo": r["repo"],
             "path": r["path"], "title": r["title"], "text": body[:1200],
             "sha256": r["sha256"], "corpus": corpus, "source": source,
             "scores": {"semantic": round(semantic, 4), "lexical": round(lexical, 4),
                        "centrality": round(centrality, 4), "conformal": round(conformal, 4)},
             "lambda": round(lam, 4),
+            "retrieval_plane": r["retrieval_plane"],
             # M2M evidence of kind file{path,sha256} — carries corpus+source so the
             # agent CITES exactly where each grounded claim came from (founder mandate).
             "evidence": {"kind": "file", "path": f"{r['repo']}/{r['path']}",
                          "sha256": r["sha256"], "corpus": corpus, "source": source,
                          "citation": f"{source}/{r['path']}"},
-        })
+        }
+        if lexical_only:
+            source_revision, source_revision_state = _source_revision(source)
+            scored_item.update(r["_reference"])
+            scored_item["source_revision"] = source_revision
+            scored_item["source_revision_state"] = source_revision_state
+        if source_witness is not None:
+            scored_item["source_state"] = retrieval_source_state(
+                r.get("sha256"), _witness_digest(source_witness.get(str(r.get("path") or ""))),
+            )
+            scored_item["production_authority"] = False
+        if r["retrieval_plane"] == "brain_handle":
+            scored_item["evidence"] = {
+                "kind": "brain_handle", "node_id": r["node_id"],
+                "handle_sha256": r["sha256"], "source": source,
+                "source_url": r.get("source_url"), "receipt_id": r.get("receipt_id"),
+                "safety_decision": r.get("safety_decision"),
+                "training_decision": r.get("training_decision"),
+                "retrieval_only": True, "gradient_authority": False,
+                "citation": r.get("source_url") or r.get("receipt_id"),
+            }
+            scored_item["training_authority"] = "NONE"
+        scored.append(scored_item)
     conn.close()
     scored.sort(key=lambda x: x["lambda"], reverse=True)
     grounded = [s for s in scored if s["lambda"] >= _LAMBDA_FLOOR][:k]
     i_dont_know = len(grounded) == 0
+    evidence_set = [
+        {
+            "rank": rank,
+            "chunk_id": item.get("chunk_id"),
+            "node_id": item.get("node_id"),
+            "repo": item.get("repo"),
+            "path": item.get("path"),
+            "sha256": item.get("sha256"),
+            "corpus": item.get("corpus"),
+            "source": item.get("source"),
+            "lambda": item.get("lambda"),
+        }
+        for rank, item in enumerate(grounded, start=1)
+    ]
+    if lexical_only:
+        # Bind each released excerpt and the sealed generation into the digest.
+        for entry, item in zip(evidence_set, grounded):
+            entry.update({
+                "generation_id": generation_id,
+                "generation_digest_sha256": meta_snapshot.get("generation_digest_sha256"),
+                "excerpt_sha256": item["excerpt_sha256"],
+                "excerpt_utf8_span": item["excerpt_utf8_span"],
+                "source_revision": item["source_revision"],
+            })
+    evidence_set_sha256 = hashlib.sha256(json.dumps(
+        evidence_set, sort_keys=True, separators=(",", ":"),
+        ensure_ascii=False).encode("utf-8")).hexdigest()
     out = {
         "ok": True,
         "query": q,
@@ -1277,21 +2843,120 @@ def query(q: str, k: int = 6, repo: str | None = None,
         "lambda_floor": _LAMBDA_FLOOR,
         "recall_count": len(scored),
         "grounded_count": len(grounded),
+        "generation_id": generation_id,
+        "generation_digest_sha256": meta_snapshot.get("generation_digest_sha256"),
+        "recall_by_plane": {
+            "corpus": sum(1 for s in scored if s["retrieval_plane"] == "corpus"),
+            "brain_handles": sum(1 for s in scored if s["retrieval_plane"] == "brain_handle"),
+        },
+        "brain_handle_count": int(meta_snapshot.get("brain_handle_count") or 0),
+        "training_authority_rows": 0,
         "i_dont_know": i_dont_know,
         "chunks": grounded,
+        "evidence_set": evidence_set,
+        "evidence_set_sha256": evidence_set_sha256,
         "honest_note": ("no chunk cleared the Λ relevance floor — returning i_dont_know "
                         "rather than fabricating support (Self-RAG)") if i_dont_know else None,
     }
     if emit_receipt:
         rec = emit_receipt("org_rag.query", {
             "query": q[:120], "grounded": len(grounded), "i_dont_know": i_dont_know,
-            "dense": qvec is not None})
+            "dense": qvec is not None,
+            "evidence_set_sha256": evidence_set_sha256})
         out["khipu_hash"] = rec.get("hash")
+    if source_witness is not None:
+        observed_states = sorted({item.get("source_state", "UNBOUND") for item in grounded})
+        out["source_states"] = observed_states
+        out["index_stale"] = "STALE" in observed_states
+        out["production_authority"] = False
+    if revoked_suppressed:
+        out["revoked_suppressed"] = revoked_suppressed
+    if lexical_only:
+        out.update({
+            "lexical_contract": LEXICAL_REFERENCE_CONTRACT,
+            "retrieval_method": "lexical",
+            "lexical_backend": lexical_backend,
+            "retrieval_planes": ["corpus"],
+            "inference": "NOT_INVOKED",
+            "embedder_invoked": False,
+            "router_dispatch_count": 0,
+            "receipt_emitted": False,
+            "generation_status": "ACTIVE",
+            "excerpt_max_utf8_bytes": _LEXICAL_EXCERPT_MAX_BYTES,
+            "support_statement": _LEXICAL_SUPPORT_STATEMENT,
+        })
     return out
+
+
+def hydrate_answer_evidence(subject: Any, handles: tuple, *, authorizer: Callable) -> list[dict]:
+    """Controller-only exact-generation hydration after explicit access checks.
+
+    This does not register an HTTP surface or infer tenant/visibility from repo
+    names. The caller supplies its authenticated identity and policy resolver.
+    Full bytes stay in memory and are never added to query/status receipts.
+    """
+    from a11oy_agent_loop import SynthesisSubject, SynthesisHandle, SynthesisAdmissionError
+
+    def require(condition: bool, reason: str) -> None:
+        if not condition:
+            raise SynthesisAdmissionError(reason)
+
+    require(type(subject) is SynthesisSubject and subject.authenticated is True
+            and all(isinstance(value, str) and value.strip() and len(value) <= 512
+                    for value in (subject.principal_id, subject.tenant_id))
+            and isinstance(subject.policy_revision, str)
+            and re.fullmatch(r"(?:[0-9a-f]{40}|[0-9a-f]{64})", subject.policy_revision) is not None,
+            "HYDRATION_SUBJECT_UNAVAILABLE")
+    require(isinstance(handles, tuple) and 1 <= len(handles) <= 6
+            and all(type(handle) is SynthesisHandle for handle in handles),
+            "HYDRATION_HANDLES_INVALID")
+    require(callable(authorizer), "HYDRATION_AUTHORIZATION_UNAVAILABLE")
+    for handle in handles:
+        try:
+            allowed = authorizer(subject, handle)
+        except Exception as exc:
+            raise SynthesisAdmissionError("HYDRATION_AUTHORIZATION_UNAVAILABLE") from exc
+        require(allowed is True, "HYDRATION_ACCESS_DENIED")
+    require(len({(h.generation_id, h.chunk_id) for h in handles}) == len(handles),
+            "HYDRATION_DUPLICATE_SOURCE")
+    conn = _db_readonly()
+    try:
+        conn.execute("BEGIN")
+        active = _active_generation(conn)
+        require(active is not None and all(h.generation_id == active for h in handles),
+                "HYDRATION_GENERATION_CHANGED")
+        generation = conn.execute(
+            "SELECT status,digest_sha256 FROM org_generations WHERE generation_id=?",
+            (active,),
+        ).fetchone()
+        require(generation is not None and generation["status"] == "ACTIVE"
+                and all(h.generation_digest_sha256 == generation["digest_sha256"] for h in handles),
+                "HYDRATION_GENERATION_INVALID")
+        output = []
+        for handle in handles:
+            rows = conn.execute(
+                "SELECT chunk_id,node_id,repo,path,source,sha256,body "
+                "FROM org_chunks_gen WHERE generation_id=? AND chunk_id=? LIMIT 2",
+                (active, handle.chunk_id),
+            ).fetchall()
+            require(len(rows) == 1, "HYDRATION_SOURCE_UNAVAILABLE")
+            row = rows[0]
+            require(all(row[key] == getattr(handle, key) for key in (
+                "chunk_id", "node_id", "repo", "path", "source", "sha256")),
+                "HYDRATION_SOURCE_MISMATCH")
+            body = row["body"]
+            require(isinstance(body, str) and 0 < len(body.encode("utf-8")) <= 32_768
+                    and hashlib.sha256(body.encode("utf-8")).hexdigest() == handle.sha256,
+                    "HYDRATION_CONTENT_DIGEST_INVALID")
+            output.append({"handle": handle, "content": body})
+        return output
+    finally:
+        conn.close()
 
 
 def repo_map(repo: str) -> dict[str, Any]:
     """Aider-style repo map: files → symbols, ranked by Λ-weighted graph centrality."""
+    _rehydrate_runtime_state()
     if not _BUILD_META.get("built"):
         return {"ok": False, "honest_error": "org index not built — call build_index first",
                 "repo": repo}
@@ -1309,6 +2974,7 @@ def repo_map(repo: str) -> dict[str, Any]:
 
 def graph_dict() -> dict[str, Any]:
     """Org graph for the 3D UI (nodes/edges). Honest empty state if not built."""
+    _rehydrate_runtime_state()
     d = _GRAPH.to_dict()
     d["built"] = _BUILD_META.get("built", False)
     d["meta"] = _BUILD_META
@@ -1316,8 +2982,18 @@ def graph_dict() -> dict[str, Any]:
 
 
 def status() -> dict[str, Any]:
+    _rehydrate_runtime_state()
+    handle_plane = dict(_BUILD_META.get("brain_handle_plane") or {})
+    handle_plane.setdefault("state", "NOT_INDEXED")
+    handle_plane.setdefault("count", int(_BUILD_META.get("brain_handle_count") or 0))
+    handle_plane["gradient_authority_rows"] = 0
+    handle_plane["training_authority"] = "NONE"
     return {"ok": True, **_BUILD_META, "db_path": RAG_DB_PATH,
             "lambda_floor": _LAMBDA_FLOOR,
+            "brain_handle_plane": handle_plane,
+            "corpus_chunk_count": int(_BUILD_META.get("corpus_chunk_count") or 0),
+            "brain_handle_count": int(_BUILD_META.get("brain_handle_count") or 0),
+            "training_authority_rows": 0,
             "corpus": corpus_manifest(),
             "build_state": build_state()}
 
@@ -1363,9 +3039,16 @@ def build_waqay_backend(bit_width: int = 2,
         return {"ok": False, "honest_error": f"szl_waqay unavailable: {e}", "label": "WAQAY"}
     conn = _db()
     try:
-        rows = list(conn.execute("SELECT chunk_id,dim,vec FROM org_vectors"))
+        _init_schema(conn)
+        generation_id = _active_generation(conn)
+        rows = list(conn.execute(
+            "SELECT chunk_id,dim,vec FROM org_vectors_gen WHERE generation_id=?",
+            (generation_id,))) if generation_id else list(
+                conn.execute("SELECT chunk_id,dim,vec FROM org_vectors"))
     except Exception as e:
+        conn.close()
         return {"ok": False, "honest_error": f"org_vectors unavailable: {e}", "label": "WAQAY"}
+    conn.close()
     if not rows:
         return {"ok": False, "honest_error": "no dense vectors in org_vectors "
                 "(FTS5-only runtime) — WAQAY needs an embedding model present",
@@ -1390,6 +3073,7 @@ def build_waqay_backend(bit_width: int = 2,
     _WAQAY_INDEX = idx
     comp = idx.compression()
     _WAQAY_META = {"built": True, "n": len(ids), "dim": dim, "bit_width": bit_width,
+                   "generation_id": generation_id,
                    "compression_MEASURED": comp,
                    "recall_MODELED": szl_waqay.WaqayIndex.modeled_recall_bound(bit_width),
                    "label": "WAQAY"}
@@ -1418,7 +3102,9 @@ def waqay_query(q: str, k: int = 6, repo: str | None = None,
         return {"ok": False, "honest_error": f"szl_waqay unavailable: {e}",
                 "fallback": query(q, k=k, repo=repo, hyde_text=hyde_text,
                                   emit_receipt=emit_receipt)}
-    if _WAQAY_INDEX is None or not _WAQAY_META.get("built"):
+    active_generation = _BUILD_META.get("generation_id")
+    if (_WAQAY_INDEX is None or not _WAQAY_META.get("built")
+            or _WAQAY_META.get("generation_id") != active_generation):
         b = build_waqay_backend(emit_receipt=emit_receipt)
         if not b.get("ok"):
             # honest fallback to exact path — opting in never costs recall.
@@ -1437,12 +3123,18 @@ def waqay_query(q: str, k: int = 6, repo: str | None = None,
                                      allow=allow, data_label="LIVE")
     # Hydrate returned chunk ids with their text from org_chunks.
     conn = _db()
+    _init_schema(conn)
+    generation_id = _active_generation(conn)
     chunks = []
     for item in gres.get("results", []):
         cid = item["id"]
         try:
-            row = conn.execute("SELECT chunk_id,repo,path,corpus,source,title,body,sha256 "
-                               "FROM org_chunks WHERE chunk_id=?", (cid,)).fetchone()
+            row = (conn.execute(
+                "SELECT chunk_id,repo,path,corpus,source,title,body,sha256 "
+                "FROM org_chunks_gen WHERE generation_id=? AND chunk_id=?",
+                (generation_id, cid)).fetchone() if generation_id else
+                conn.execute("SELECT chunk_id,repo,path,corpus,source,title,body,sha256 "
+                             "FROM org_chunks WHERE chunk_id=?", (cid,)).fetchone())
         except Exception:
             row = None
         if row is not None:
@@ -1453,6 +3145,7 @@ def waqay_query(q: str, k: int = 6, repo: str | None = None,
                            "evidence": {"file": {"path": row["path"], "sha256": row["sha256"]}}})
         else:
             chunks.append({"chunk_id": cid, "score_approx": item["score"]})
+    conn.close()
     if emit_receipt:
         emit_receipt("org_rag.waqay.query", {"query": q[:120], "k": k,
                      "returned": [c["chunk_id"] for c in chunks]})
