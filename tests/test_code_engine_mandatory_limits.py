@@ -326,9 +326,94 @@ def test_inherited_limits_are_never_loosened(monkeypatch, launcher):
     result = code_engine._sandbox_exec(INERT_FIXTURE, timeout_s=6, mem_mb=256)
 
     assert result["execution_attempted"] is True
-    assert dict(res.set_calls)["RLIMIT_CPU"] == (1, 2)
+    assert dict(res.set_calls)["RLIMIT_CPU"] == (1, 1)
     assert dict(res.set_calls)["RLIMIT_AS"] == (128 * MIB, 128 * MIB)
     assert len(launcher.execs) == 1
+
+
+@pytest.mark.parametrize("inf", [-1, 2**63 - 1], ids=["negative-infinity", "positive-infinity"])
+@pytest.mark.parametrize("soft,hard,expected", [
+    (1, 10, 1),              # inherited soft must be an unraisable ceiling
+    (1, 2, 1),               # the original inherited-limits regression
+    (0, 10, 0),              # zero remains a finite limit, not infinity
+    (6, 10, 6),              # inherited soft matches the mandate
+    (10, 10, 6),             # mandate is stricter than either inherited value
+    (1, None, 1),            # finite soft with unlimited hard
+    (None, None, 6),         # both unlimited: use the mandate
+    (None, 2, 2),            # defensive: still honor a finite inherited hard
+    (2**40, 2**41, 6),       # large finite integers remain finite
+])
+def test_inherited_cpu_soft_is_a_hard_ceiling(monkeypatch, launcher, inf,
+                                              soft, hard, expected):
+    soft = inf if soft is None else soft
+    hard = inf if hard is None else hard
+    res = FakeResource(
+        soft={name: inf for name in MANDATORY},
+        hard={name: inf for name in MANDATORY})
+    res.RLIM_INFINITY = inf
+    res.limits[_IDS["RLIMIT_CPU"]] = (soft, hard)
+    _install(monkeypatch, res)
+    inherited = dict(res.limits)
+
+    planned_res, plan, refusal = code_engine._plan_mandatory_rlimits(6, 256)
+
+    assert refusal is None and planned_res is res
+    assert res.limits == inherited and res.set_calls == []
+    assert launcher.calls == []  # planning cannot launch even the fake child
+    assert dict((name, limits) for name, _, limits in plan)["RLIMIT_CPU"] == (
+        expected, expected)
+
+    code_engine._apply_mandatory_rlimits(res, plan)
+
+    assert dict(res.set_calls)["RLIMIT_CPU"] == (expected, expected)
+    assert res.applied() == list(MANDATORY)
+    assert launcher.calls == []
+
+
+@pytest.mark.parametrize("name", MANDATORY)
+def test_each_mandatory_limit_hard_cap_respects_inherited_soft(monkeypatch, name):
+    """CPU and AS tighten to inherited soft; zero mandates stay zero."""
+    inherited_soft = {"RLIMIT_CPU": 1, "RLIMIT_AS": 128 * MIB,
+                      "RLIMIT_CORE": 7, "RLIMIT_FSIZE": 7, "RLIMIT_NPROC": 7}[name]
+    mandate = {"RLIMIT_CPU": 6, "RLIMIT_AS": 256 * MIB,
+               "RLIMIT_CORE": 0, "RLIMIT_FSIZE": 0, "RLIMIT_NPROC": 0}[name]
+    res = _install(monkeypatch, FakeResource(
+        soft={name: inherited_soft}, hard={name: inherited_soft * 2}))
+
+    _, plan, refusal = code_engine._plan_mandatory_rlimits(6, 256)
+
+    assert refusal is None and res.set_calls == []
+    limits = dict((n, values) for n, _, values in plan)[name]
+    expected = min(mandate, inherited_soft)
+    assert limits == (expected, expected)
+
+
+def test_inherited_soft_ceiling_is_applied_before_fake_exec(monkeypatch, launcher):
+    res = _install(monkeypatch, FakeResource(
+        soft={"RLIMIT_CPU": 1}, hard={"RLIMIT_CPU": 10}))
+
+    result = code_engine._sandbox_exec(INERT_FIXTURE, timeout_s=6)
+
+    assert result["execution_attempted"] is True
+    assert len(launcher.execs) == 1
+    assert dict(res.set_calls)["RLIMIT_CPU"] == (1, 1)
+
+
+def test_inherited_soft_ceiling_readback_rejects_raisable_hard(monkeypatch, launcher):
+    class LeavesHardRaisable(FakeResource):
+        def setrlimit(self, rid, limits):
+            super().setrlimit(rid, limits)
+            if rid == self.RLIMIT_CPU:
+                self.limits[rid] = (limits[0], 6)
+
+    _install(monkeypatch, LeavesHardRaisable(
+        soft={"RLIMIT_CPU": 1}, hard={"RLIMIT_CPU": 10}))
+
+    result = code_engine._sandbox_exec(INERT_FIXTURE, timeout_s=6)
+
+    _assert_denied(result)
+    assert result["error"] == code_engine._LIMIT_HOOK_FAILED_ERROR
+    assert launcher.execs == []
 
 
 def test_preflight_with_real_resource_module_is_read_only():
