@@ -515,7 +515,9 @@ def _plan_mandatory_rlimits(timeout_s: int, mem_mb: int):
             return None, None, ("sandbox unavailable: mandatory rlimit %s cannot be read (%s)"
                                 % (name, type(e).__name__))
         soft, hard = mandated[name]
-        eff_hard = _rlim_stricter(hard, cur_hard, inf)
+        # Freeze any stricter inherited soft limit into the child's hard ceiling:
+        # otherwise the child could raise its soft limit back toward the mandate.
+        eff_hard = _rlim_stricter(_rlim_stricter(hard, cur_hard, inf), cur_soft, inf)
         eff_soft = _rlim_stricter(_rlim_stricter(soft, cur_soft, inf), eff_hard, inf)
         plan.append((name, rid, (eff_soft, eff_hard)))
     return res, plan, None
