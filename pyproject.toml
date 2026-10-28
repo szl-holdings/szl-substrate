@@ -25,6 +25,39 @@ dependencies = [
 dev = [
     "pytest>=8",
 ]
+# Runtime extras, named after the modules that need them. `import szl_substrate` needs
+# only the core dependency above; tests/test_dependency_contract.py maps every
+# third-party import to core or to one of these groups and fails on anything unmapped.
+# Floors are the lowest versions installed and tested on 2026-10-28 (a11oy runtime pins,
+# VM1); numpy 2.2.6 is the last numpy release that supports Python 3.10.
+web = [
+    # ASGI route modules (operator_shell_v4, szl_waqay, szl_yupay, ...). httpx backs
+    # starlette.testclient and the szl_deepdive_gaps fleet roll-up.
+    "fastapi>=0.143.2",
+    "starlette>=1.7.0",
+    "httpx>=0.28.1",
+]
+rag = [
+    # a11oy_org_rag: GitHub/HF ingest (httpx) and the dense WAQAY backend (numpy).
+    "httpx>=0.28.1",
+    "numpy>=2.2.6",
+]
+khipu = [
+    # szl_khipu_lmdb and szl_unay_routes (LMDB-backed khipu store).
+    "lmdb>=2.3.0",
+]
+sigstore = [
+    # szl_formulas.verify_dsse_real (Sigstore bundle verification).
+    "sigstore>=4.5.1",
+]
+all = [
+    "fastapi>=0.143.2",
+    "starlette>=1.7.0",
+    "httpx>=0.28.1",
+    "numpy>=2.2.6",
+    "lmdb>=2.3.0",
+    "sigstore>=4.5.1",
+]
 
 [project.urls]
 Homepage = "https://github.com/szl-holdings/szl-substrate"
