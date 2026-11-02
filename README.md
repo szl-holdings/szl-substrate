@@ -106,6 +106,13 @@ ece = szl_calibration.expected_calibration_error([0.9, 0.8], [True, False])
 tier = szl_brain.pick_tier([0.99, 0.98, 0.97])   # -> high-trust fast tier
 ```
 
+`szl_conformal.conformal_quantile` requires every calibration score to represent
+a finite `1-p` value in `[0, 1]`. A malformed, boolean, non-finite, or out-of-range
+score makes the entire pool fall back to `q_hat = 1.0`, so `conformal_set` retains
+the full label space. Invalid evidence is neither replaced with zero nor dropped.
+Finite numeric strings keep their existing conversion behavior. This package
+repair does not update app-local fallback copies or attest to their deployment.
+
 ### DSSE numeric boundary
 
 New `szl_dsse.canonical_json` / `sign_payload` calls reject `NaN`, positive
