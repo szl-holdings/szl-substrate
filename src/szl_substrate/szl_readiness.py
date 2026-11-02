@@ -17,8 +17,10 @@ read from three independent surfaces —
 
 The centrepiece is the **deployed-vs-repo parity** section, which compares the
 deployment's *reported build commit* (``/version`` ``git_sha``) against the
-repository HEAD via the GitHub *compare* API and reports an honest
-``behind_by`` delta. The doctrine anchor (``kernel_commit``) is the locked,
+captured repository HEAD via the GitHub *compare* API and distinguishes
+``current``, ``behind``, ``ahead``, ``diverged`` and ``unknown``. Only equal
+commit identities are current; commit counts describe the two directions.
+The doctrine anchor (``kernel_commit``) is the locked,
 kernel-verified formulas commit; it is surfaced verbatim and labelled as such —
 it is NEVER equated with HEAD, because the two are different kinds of thing.
 
@@ -394,9 +396,9 @@ def _gh_commit_exists(repo: str, sha: str, fresh: bool = False) -> Dict[str, Any
 
 
 def _gh_compare(repo: str, base: str, head: str, fresh: bool = False) -> Dict[str, Any]:
-    """Compare base...head. With base=deployed_sha, head=branch: ahead_by is how
-    many commits the branch is ahead of the deployment (i.e. how far BEHIND the
-    deployment is); behind_by is deployment-only commits (normally 0)."""
+    """Compare base...head. With base=deployed_sha, head=captured_repo_sha:
+    ahead_by counts repository-only commits (how far BEHIND the deployment
+    is); behind_by counts deployment-only commits (normally 0)."""
     if not base or not head:
         return {"mode": "unreachable", "ahead_by": None}
     key = "ghcmp:" + repo + ":" + base + "..." + head
@@ -651,20 +653,35 @@ def _sec_parity(cfg: Dict[str, Any], fresh: bool = False) -> Dict[str, Any]:
             build.update(status="current", behind_by=0,
                          detail="deployed build is at repo HEAD")
         else:
-            cmp = _gh_compare(repo, git_sha, branch, fresh=fresh)
+            cmp = _gh_compare(repo, git_sha, head, fresh=fresh)
             build["compare_mode"] = cmp.get("mode")
             ab = cmp.get("ahead_by")
-            if cmp.get("mode") == "unreachable" or ab is None:
+            bb = cmp.get("behind_by")
+            if (cmp.get("mode") == "unreachable"
+                    or type(ab) is not int or type(bb) is not int
+                    or ab < 0 or bb < 0):
                 build.update(status="unknown",
-                             detail="could not compute commit delta (compare unreachable)")
+                             detail="could not compute commit delta (compare unavailable or invalid)")
+            elif ab == 0 and bb == 0:
+                # Distinct identities cannot be reported as an exact match,
+                # even if an inconsistent compare response claims no delta.
+                build.update(status="unknown",
+                             detail="distinct commit identities but compare reports no delta")
             else:
-                build.update(status=("current" if ab == 0 else "behind"),
+                status = "diverged" if ab and bb else ("behind" if ab else "ahead")
+                if status == "diverged":
+                    detail = ("deployed build diverges from observed %s HEAD: "
+                              "%d repository-only and %d deployment-only commit(s)"
+                              % (branch, ab, bb))
+                elif status == "behind":
+                    detail = "deployed build is %d commit(s) behind observed %s HEAD" % (ab, branch)
+                else:
+                    detail = "deployed build is %d commit(s) ahead of observed %s HEAD" % (bb, branch)
+                build.update(status=status,
                              behind_by=ab,
-                             deployment_ahead_by=cmp.get("behind_by"),
+                             deployment_ahead_by=bb,
                              compare_status=cmp.get("status"),
-                             detail=("deployed build is %d commit(s) behind %s"
-                                     % (ab, branch)) if ab else
-                                    ("deployed build matches %s" % branch))
+                             detail=detail)
     else:
         build.update(status="unknown",
                      detail="deployed git_sha or repo HEAD unavailable")
