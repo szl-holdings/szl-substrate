@@ -93,8 +93,9 @@ PUB_KEY_URL = "https://github.com/szl-holdings/.github/blob/main/cosign.pub"
 # ---------------------------------------------------------------------------
 
 def canonical_json(obj: Any) -> bytes:
-    """Deterministic canonical JSON: sorted keys, no extra whitespace, UTF-8."""
-    return json.dumps(obj, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
+    """Deterministic finite JSON; non-finite numbers raise ValueError."""
+    return json.dumps(obj, sort_keys=True, separators=(",", ":"),
+                      ensure_ascii=False, allow_nan=False).encode("utf-8")
 
 
 def pae(payload_type: str, body: bytes) -> bytes:
@@ -164,7 +165,8 @@ def sign_payload(payload_obj: Any, payload_type: str = KHIPU_PAYLOAD_TYPE) -> di
     Returns the DSSE envelope dict:
       {payload(b64), payloadType, signatures:[{sig(b64), keyid}], ...meta}
     If no private key is present, returns an UNSIGNED envelope with an explicit
-    honesty marker (NO fabricated signature)."""
+    honesty marker (NO fabricated signature). Non-finite JSON numbers raise
+    ValueError before accessing signing material or creating an envelope."""
     body = canonical_json(payload_obj)
     to_sign = pae(payload_type, body)
     env: dict[str, Any] = {
