@@ -76,12 +76,15 @@ _REF = ("Split/inductive conformal prediction (Vovk 2005; Angelopoulos & Bates "
 
 
 def _as_float_list(xs: Sequence[Any]) -> list[float]:
+    """Convert valid 1-p scores without inventing calibration observations."""
     out: list[float] = []
     for x in xs:
-        try:
-            out.append(float(x))
-        except (TypeError, ValueError):
-            out.append(0.0)
+        if isinstance(x, bool):
+            raise ValueError("a calibration score must be a probability, not a boolean")
+        score = float(x)
+        if not math.isfinite(score) or not 0.0 <= score <= 1.0:
+            raise ValueError("a calibration score must be finite and in [0, 1]")
+        out.append(score)
     return out
 
 
@@ -111,7 +114,12 @@ def conformal_quantile(scores: Sequence[float], alpha: float = DEFAULT_ALPHA) ->
     except (TypeError, ValueError):
         a = DEFAULT_ALPHA
     a = min(0.999, max(1e-6, a))
-    s = sorted(_as_float_list(scores))
+    try:
+        s = sorted(_as_float_list(scores))
+    except (TypeError, ValueError, OverflowError):
+        # A corrupt pool cannot justify excluding any class. Do not replace bad
+        # observations with zero or silently remove them from the sample count.
+        return 1.0
     n = len(s)
     if n == 0:
         return 1.0
