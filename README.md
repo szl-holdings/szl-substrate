@@ -106,6 +106,21 @@ ece = szl_calibration.expected_calibration_error([0.9, 0.8], [True, False])
 tier = szl_brain.pick_tier([0.99, 0.98, 0.97])   # -> high-trust fast tier
 ```
 
+### DSSE numeric boundary
+
+New `szl_dsse.canonical_json` / `sign_payload` calls reject `NaN`, positive
+infinity, and negative infinity, including nested values and numeric keys,
+with `ValueError` before accessing signing material. Finite payloads retain
+their previous JSON and PAE bytes; absent keys still produce an honest unsigned
+envelope for valid payloads.
+
+`verify_envelope` continues to verify the original signed bytes, without
+re-serializing them or invalidating historical signatures. Its `verified`
+field is a cryptographic verdict, **not** receipt-schema or numeric-evidence
+admission. Historical non-finite payloads still require semantic validation
+by their consumer. This package repair does not update the app-local fallback
+copies or establish that a running app has adopted the repaired package.
+
 ## The guarded-import pattern (how the apps adopt this)
 
 The apps do **not** delete their local copy in this pass. They import through a
