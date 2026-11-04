@@ -178,6 +178,14 @@ budgets, fail-closed gates) — there is **no** perpetual-motion or zero-cost cl
 - **SLSA** — L1 honest, L2 roadmap. No L2/L3 claim is made for this package.
 - **Trust ceiling 0.97.**
 
+The operational-readiness reader compares the deployment's reported commit
+against the captured repository HEAD. Build parity is `current` only when
+those identities match. Otherwise it reports `behind`, `ahead`, `diverged`,
+or `unknown`, retaining repository-only and deployment-only commit counts.
+Unavailable, invalid, or contradictory comparison counts remain `unknown`;
+cached readings retain their cache label. These comparisons describe reported
+source identities and do not independently attest deployed bytes.
+
 ## Sources cited in code
 
 - DSSE PAE / envelope — secure-systems-lab/dsse: <https://github.com/secure-systems-lab/dsse>
