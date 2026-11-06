@@ -196,3 +196,5 @@ source identities and do not independently attest deployed bytes.
 ## License
 
 Apache-2.0 — see [LICENSE](LICENSE). © 2026 Lutar, Stephen P. — SZL Holdings.
+
+Estate on Hugging Face: models, datasets and Spaces are published under the [SZLHOLDINGS](https://huggingface.co/SZLHOLDINGS) org.
