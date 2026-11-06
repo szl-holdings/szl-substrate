@@ -1,0 +1,15 @@
+# Hash-locked dependencies for .github/workflows/base-python-ci.yml: ruff, the
+# core dependency and the dev extra from pyproject.toml (same specifiers;
+# enforced by tests/test_ci_requirements.py), and hatchling + editables for the
+# --no-deps --no-build-isolation -e . install of the package. The web extra is
+# deliberately absent: this gate checks that the suite runs without
+# fastapi/starlette/httpx installed.
+#
+# Regenerate after editing:
+#   uv pip compile --universal --python-version 3.10 --generate-hashes \
+#     requirements/ci/base.in -o requirements/ci/base.txt
+cryptography>=42
+pytest>=8
+ruff
+hatchling
+editables

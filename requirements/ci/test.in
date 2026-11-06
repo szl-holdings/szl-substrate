@@ -1,0 +1,16 @@
+# Hash-locked dependencies for .github/workflows/ci.yml: the core dependency plus
+# the dev and web extras from pyproject.toml (same specifiers; enforced by
+# tests/test_ci_requirements.py), and hatchling + editables so the package
+# itself installs with --no-deps --no-build-isolation -e . instead of resolving
+# an unhashed build environment.
+#
+# Regenerate after editing:
+#   uv pip compile --universal --python-version 3.10 --generate-hashes \
+#     requirements/ci/test.in -o requirements/ci/test.txt
+cryptography>=42
+pytest>=8
+fastapi>=0.143.2
+starlette>=1.7.0
+httpx>=0.28.1
+hatchling
+editables
