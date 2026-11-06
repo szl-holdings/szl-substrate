@@ -21,11 +21,10 @@ You will receive an acknowledgement within 72 hours and a triage decision
 | Version                   | Supported    |
 | ------------------------- | ------------ |
 | default branch (`main`)   | yes          |
-| latest tagged release     | yes          |
-| anything older            | best-effort  |
+| anything else             | best-effort  |
 
-<!-- Adjust this table to the repo's actual release cadence. UNKNOWN is
-     never claimed as supported. -->
+No release has been tagged or published to PyPI yet, so `main` is the only
+supported line.
 
 ## Receipt verification
 

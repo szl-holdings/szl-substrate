@@ -1,10 +1,10 @@
 name: CodeQL
 
-# Self-contained CodeQL SAST for Python (SZL private-repo pattern).
-# PRIVATE repos on this tier lack GHAS code-scanning uploads, so we run the analysis
-# with upload:false — CodeQL still parses the tree and fails the job on analysis errors,
-# giving real SAST coverage without a Security-tab backend. Flip upload back to default
-# if GHAS Code Security is enabled later. All actions SHA-pinned (org policy).
+# Self-contained CodeQL SAST for Python. This repository is public, so code
+# scanning results upload to the Security tab (the action's default) and pull
+# requests get the code-scanning check. The earlier private-repo pattern ran with
+# upload:false, which only failed on analysis errors and never surfaced a
+# finding. All actions SHA-pinned (org policy).
 
 on:
   push:
@@ -40,6 +40,8 @@ jobs:
           egress-policy: audit
       - name: Checkout repository
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
       - name: Initialize CodeQL
         uses: github/codeql-action/init@9b3254085494b55a0f7c4c2b3d2d52cc712ce370 # v4.39.1
         with:
@@ -49,4 +51,3 @@ jobs:
         uses: github/codeql-action/analyze@9b3254085494b55a0f7c4c2b3d2d52cc712ce370 # v4.39.1
         with:
           category: "/language:${{ matrix.language }}"
-          upload: false

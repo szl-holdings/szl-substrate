@@ -73,7 +73,7 @@ def register(app, ns: str = "a11oy") -> str:
         except Exception as e:  # honest error, never crash
             return JSONResponse({"connector_id": cid, "state": "error",
                                  "records": [], "live": False,
-                                 "note": f"read failed: {type(e).__name__}: {e}"},
+                                 "note": f"read failed: {type(e).__name__}: {type(e).__name__}"},
                                 status_code=502)
 
     # ── per-connector write (Λ-gated + DSSE-receipted) ───────────────────────
@@ -94,7 +94,7 @@ def register(app, ns: str = "a11oy") -> str:
             return JSONResponse(c.write(action or {}).to_dict())
         except Exception as e:
             return JSONResponse({"connector_id": cid, "ok": False, "state": "error",
-                                 "detail": f"write failed: {type(e).__name__}: {e}"},
+                                 "detail": f"write failed: {type(e).__name__}: {type(e).__name__}"},
                                 status_code=502)
 
     # ── OAuth2 start: build PKCE authorize URL with signed state ─────────────
@@ -105,7 +105,7 @@ def register(app, ns: str = "a11oy") -> str:
             out = _oauth.build_authorize_url(cid, redirect_uri=ru)
             return JSONResponse(out)
         except Exception as e:
-            return JSONResponse({"connector_id": cid, "error": str(e),
+            return JSONResponse({"connector_id": cid, "error": type(e).__name__,
                                  "detail": "no OAuth profile for this connector or misconfigured"},
                                 status_code=400)
 
@@ -119,7 +119,7 @@ def register(app, ns: str = "a11oy") -> str:
             safe = {k: v for k, v in out.items() if k not in ("access_token", "refresh_token")}
             return JSONResponse(safe)
         except Exception as e:
-            return JSONResponse({"connector_id": cid, "error": str(e)}, status_code=400)
+            return JSONResponse({"connector_id": cid, "error": type(e).__name__}, status_code=400)
 
     # ── standalone Integrations / Enterprise Mesh page ───────────────────────
     @app.get("/integrations", include_in_schema=False)

@@ -1,11 +1,11 @@
 # SPDX-License-Identifier: Apache-2.0
 # © 2026 Lutar, Stephen P. — SZL Holdings · ORCID 0009-0001-0110-4173
-# Doctrine v10 — 749 declarations · 14 unique axioms · 163 sorries · 21 canonical formulas
+# Doctrine v11 — 749 declarations · 14 unique axioms · 163 sorries
 """
 szl_anatomy_routes.py — ADDITIVE FastAPI router for the Anatomy substrate.
 
 Mounts (additive — never overrides existing routes):
-  GET  /formulas                       — HTML grid of all 21 canonical formulas + live demo
+  GET  /formulas                       — HTML grid of every szl_formulas.REGISTRY entry + live demo
   POST /api/{ns}/v1/formulas/{name}     — run one formula, return result + Λ-receipt
   GET  /api/{ns}/v1/formulas            — JSON registry (name, proof-status, chakra)
   GET  /composer                        — HTML composer UI (chain formulas → governed loop)
@@ -38,9 +38,12 @@ try:  # pragma: no cover - only present when a FastAPI Space imports us
 except Exception:  # allows pure-Python (Gradio) import without FastAPI
     Request = HTMLResponse = JSONResponse = None  # type: ignore
 
-REPO = "https://github.com/szl-holdings/szl-cookbook/tree/main/recipes"
-FORMULA_SRC = f"{REPO}/canonical-formulas-v1/code/python/formulas.py"
-COMPOSER_SRC = f"{REPO}/codex-kernel-composer-v1/code/python/composer.py"
+# The registry and the Codex-Kernel composer both live in szl_formulas (the module
+# imported above), so both source links point at it. The former szl-cookbook
+# recipe paths never existed in that repository, which is now archived.
+REPO = "https://github.com/szl-holdings/szl-substrate/blob/main/src/szl_substrate"
+FORMULA_SRC = f"{REPO}/szl_formulas.py"
+COMPOSER_SRC = FORMULA_SRC
 
 # 8-chakra → formula binding (matches anatomy-evolved-v1; chakra 8 = Bindu/DINN).
 CHAKRAS: List[Dict[str, Any]] = [
@@ -101,7 +104,7 @@ def run_one(name: str, args: List[Any], kwargs: Dict[str, Any] | None = None) ->
     try:
         out = fn(*a, **(kwargs or {}))
     except Exception as exc:  # honest error surface
-        return {"ok": False, "error": str(exc)}
+        return {"ok": False, "error": type(exc).__name__}
     jr = _jsonify(out)
     receipt = sha256(f"{name}|{args}|{jr}".encode()).hexdigest()
     return {
@@ -141,8 +144,8 @@ def _page(title: str, body: str) -> str:
  .chip{{display:inline-block;background:#2c1a52;border:1px solid #4a3470;border-radius:999px;padding:4px 10px;margin:3px;font-size:13px}}
  pre.out{{white-space:pre-wrap;max-height:320px;overflow:auto}}
 </style></head><body><h1>{title}</h1>{body}
-<p style="margin-top:32px;color:#8a7aa8;font-size:12px">SZL Holdings · Anatomy substrate · Doctrine v10 (749/14/163) · 21 canonical formulas ·
-<a href="{FORMULA_SRC}">formulas.py</a> · <a href="{COMPOSER_SRC}">composer.py</a> · Hatun-Willay</p>
+<p style="margin-top:32px;color:#8a7aa8;font-size:12px">SZL Holdings · Anatomy substrate · Doctrine v11 (749/14/163) · {len(S.REGISTRY)} canonical formulas ·
+<a href="{FORMULA_SRC}">szl_formulas.py</a> (registry + composer) · Hatun-Willay</p>
 </body></html>"""
 
 

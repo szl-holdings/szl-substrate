@@ -1,9 +1,10 @@
 szl-substrate
 Copyright 2026 SZL Contributors (ORCID: 0009-0001-0110-4173)
 
-This product includes modules extracted verbatim (byte-identical at extraction
-time, verified with `cmp`) from the a11oy and killinchu application repositories
-to establish a single shared source of truth and eliminate source duplication:
+This product includes 68 modules extracted from the a11oy and killinchu
+application repositories (byte-identical at extraction time, verified with
+`cmp`; see MIGRATION.md) to establish a single shared source of truth and
+eliminate source duplication. Among them:
 
   - szl_calibration : ECE/Brier calibration tracking (pure-Python).
   - szl_dsse        : DSSE/ECDSA-P256-SHA256 signing (cosign-compatible), with
@@ -11,6 +12,13 @@ to establish a single shared source of truth and eliminate source duplication:
                       from khipu-consensus.
   - szl_brain       : governed reasoning-brain scaffolding (Λ aggregator,
                       advisory — Conjecture 1).
+
+src/szl_substrate/_vendor_blobs.py embeds third-party assets that are not
+covered by the Apache-2.0 license of this product: 60 KaTeX font files and
+the earth-night.jpg globe texture, byte-identical to files in the MIT-licensed
+npm packages katex and three-globe, and Space Grotesk and JetBrains Mono font
+files (SIL Open Font License 1.1). Their provenance, copyright notices and
+license texts are in NOTICE-THIRD-PARTY.md.
 
 Λ = Conjecture 1 (advisory, uniqueness open — NOT a proven theorem).
 Signed receipts are real DSSE in a Space with a cosign key, and an explicit

@@ -6,6 +6,12 @@
 > this single installable package — **without a big-bang cutover and without
 > breaking either running application.**
 
+> **Status note (2026-11-06):** this document records the extraction as it
+> stood at the Wave-K finish (2026-07-07), when every extracted module was
+> byte-identical to both apps. The copies have diverged since, and neither app
+> installs the package yet; see the README section "Parity with the apps today"
+> and `tools/app_parity.py` for the current, measured state.
+
 ## TRUE % DONE (Wave-K finish, 2026-07-07)
 
 | Metric | Count | % |
