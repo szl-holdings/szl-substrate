@@ -9,7 +9,7 @@
 #     requirements/ci/test.in -o requirements/ci/test.txt
 cryptography>=42
 pytest>=8
-fastapi>=0.143.2
+fastapi>=0.162.5
 starlette>=1.7.0
 httpx>=0.28.1
 hatchling
