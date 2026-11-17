@@ -43,7 +43,7 @@ dev = [
 # set from the hash-locked requirements/ci/test.txt.
 test = [
     "pytest>=8",
-    "fastapi>=0.143.2",
+    "fastapi>=0.162.5",
     "starlette>=1.7.0",
     "httpx>=0.28.1",
 ]
@@ -55,7 +55,7 @@ test = [
 web = [
     # ASGI route modules (operator_shell_v4, szl_waqay, szl_yupay, ...). httpx backs
     # starlette.testclient and the szl_deepdive_gaps fleet roll-up.
-    "fastapi>=0.143.2",
+    "fastapi>=0.162.5",
     "starlette>=1.7.0",
     "httpx>=0.28.1",
 ]
@@ -73,7 +73,7 @@ sigstore = [
     "sigstore>=4.5.1",
 ]
 all = [
-    "fastapi>=0.143.2",
+    "fastapi>=0.162.5",
     "starlette>=1.7.0",
     "httpx>=0.28.1",
     "numpy>=2.2.6",
